@@ -1,0 +1,28 @@
+# Environnement virtuel
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Données brutes (16 Mo, téléchargées automatiquement par src/data_loader.py)
+data/raw/*.csv
+
+# Modèles entraînés (régénérés par le notebook ou python -m src.train)
+models/*
+!models/.gitkeep
+
+# Système et éditeurs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml

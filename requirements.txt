@@ -1,0 +1,26 @@
+# Versions testées avec Python 3.11 à 3.13 (environnement de référence : Python 3.13)
+# Installation : pip install -r requirements.txt
+
+# Données et calcul
+numpy==2.5.3
+pandas==3.0.5
+
+# Apprentissage automatique
+scikit-learn==1.9.1
+joblib==1.6.0
+
+# Visualisation
+matplotlib==3.11.2
+seaborn==0.13.2
+plotly==7.1.0
+
+# Application prescriptive
+streamlit==1.66.1
+
+# Notebook
+ipykernel==7.4.0
+nbformat==5.11.1
+jupyterlab>=4.0
+
+# Tests
+pytest==9.1.1
