@@ -1,4 +1,4 @@
-# Versions testées avec Python 3.11 à 3.13 (environnement de référence : Python 3.13)
+# Versions testées avec Python 3.13 (Python 3.11 minimum requis par pandas 3)
 # Installation : pip install -r requirements.txt
 
 # Données et calcul
@@ -7,6 +7,7 @@ pandas==3.0.5
 
 # Apprentissage automatique
 scikit-learn==1.9.1
+scipy==1.18.1
 joblib==1.6.0
 
 # Visualisation

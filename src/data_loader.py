@@ -1,4 +1,4 @@
-"""Chargement, audit de qualité et nettoyage de base du jeu Hotel Booking Demand.
+"""Chargement, audit de qualité et nettoyage de base du jeu Hotel Booking Demand (Partie 1).
 
 Principe : ce module ne fait que des opérations LIGNE PAR LIGNE ou des
 suppressions de colonnes qui ne dépendent d'aucune statistique apprise
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import urllib.request
 from pathlib import Path
+from typing import cast
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -23,14 +24,19 @@ def download_data(path: Path = config.RAW_DATA_PATH, url: str = config.DATA_URL)
     """Télécharge hotels.csv depuis le dépôt TidyTuesday s'il est absent."""
     path = Path(path)
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)  # crée data/raw/ si besoin
         print(f"Téléchargement de {url} ...")
         urllib.request.urlretrieve(url, path)
     return path
 
 
 def load_raw_data(path: Path = config.RAW_DATA_PATH) -> pd.DataFrame:
-    """Charge le CSV brut. Les valeurs « NULL » (agent, company) deviennent NaN."""
+    """Charge le CSV brut.
+
+    na_values=["NULL"] : dans le fichier, agent et company valent le texte
+    « NULL » quand il n'y a pas d'agence ou d'entreprise ; on les lit comme
+    des valeurs manquantes (NaN) pour pouvoir les traiter correctement.
+    """
     path = Path(path)
     if not path.exists():
         download_data(path)
@@ -41,17 +47,19 @@ def quality_report(df: pd.DataFrame) -> pd.DataFrame:
     """Tableau de synthèse par colonne : type, valeurs manquantes, cardinalité."""
     report = pd.DataFrame(
         {
-            "type": df.dtypes.astype(str),
-            "manquants": df.isna().sum(),
-            "manquants_%": (df.isna().mean() * 100).round(2),
-            "valeurs_uniques": df.nunique(),
+            "type": df.dtypes.astype(str),                     # type informatique de la colonne
+            "manquants": df.isna().sum(),                      # nombre de valeurs manquantes
+            "manquants_%": (df.isna().mean() * 100).round(2),  # en pourcentage des lignes
+            "valeurs_uniques": df.nunique(),                   # cardinalité
         }
     )
+    # Les colonnes les plus incomplètes en premier
     return report.sort_values("manquants_%", ascending=False)
 
 
 def quality_issues(df: pd.DataFrame) -> pd.Series:
     """Compte les anomalies de qualité repérées lors de l'exploration."""
+    # Nombre total de clients ; children a 4 valeurs manquantes, comptées comme 0 ici
     guests = df["adults"] + df["children"].fillna(0) + df["babies"]
     issues = {
         "lignes en double": int(df.duplicated().sum()),
@@ -74,7 +82,7 @@ def quality_issues(df: pd.DataFrame) -> pd.Series:
     return pd.Series(issues, name="nombre de lignes")
 
 
-def clean_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+def clean_data(df: pd.DataFrame, verbose: bool = True, drop_leakage: bool = True) -> pd.DataFrame:
     """Nettoyage de base sans statistique apprise.
 
     1. Suppression des colonnes de fuite (statut final, chambre attribuée).
@@ -87,20 +95,34 @@ def clean_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     L'année d'arrivée est conservée dans le DataFrame (utile pour les analyses
     et la simulation de surréservation) mais n'est PAS utilisée comme variable
     explicative : elle est absente de config.RAW_INPUT_FEATURES.
+
+    drop_leakage=False garde les colonnes de fuite (date d'annulation, statut)
+    pour l'analyse prescriptive, qui fait un bilan APRÈS COUP et non une
+    prédiction. Les lignes conservées sont exactement les mêmes dans les deux
+    cas : la séparation entraînement / test est donc identique.
     """
     n_start = len(df)
-    df = df.drop(columns=config.LEAKAGE_COLUMNS)
 
+    # 2. Doublons exacts, repérés SANS les colonnes de fuite : deux réservations
+    #    qui ne diffèrent que par la date de statut sont des doublons.
+    #    (étape faite avant le retrait pour pouvoir garder ces colonnes si besoin)
     n_before = len(df)
-    df = df.drop_duplicates()
+    df = df.loc[~df.drop(columns=config.LEAKAGE_COLUMNS).duplicated()]
     n_dup = n_before - len(df)
 
+    # 1. Colonnes de fuite : connues seulement après l'issue de la réservation
+    if drop_leakage:
+        df = df.drop(columns=config.LEAKAGE_COLUMNS)
+
+    # 3. Lignes impossibles
     guests = df["adults"] + df["children"].fillna(0) + df["babies"]
-    mask_no_guest = guests == 0
-    mask_bad_adr = (df["adr"] < 0) | (df["adr"] > 5000)
+    mask_no_guest = guests == 0                                  # réservation sans client
+    mask_bad_adr = (df["adr"] < 0) | (df["adr"] > 5000)          # tarif négatif ou aberrant
+    # ~ inverse le masque : on garde les lignes qui ne sont NI sans client NI à tarif impossible
     df = df.loc[~(mask_no_guest | mask_bad_adr)].reset_index(drop=True)
 
     if verbose:
+        # .replace(",", " ") : séparateur de milliers à la française
         print(f"Lignes initiales                     : {n_start:>7,}".replace(",", " "))
         print(f"Doublons supprimés                   : {n_dup:>7,}".replace(",", " "))
         print(f"Réservations sans client supprimées  : {int(mask_no_guest.sum()):>7,}".replace(",", " "))
@@ -109,19 +131,32 @@ def clean_data(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     return df
 
 
-def split_features_target(df: pd.DataFrame):
+def split_features_target(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     """Sépare X (variables explicatives brutes) et y (is_canceled)."""
-    X = df[config.RAW_INPUT_FEATURES].copy()
-    y = df[config.TARGET].astype(int).copy()
+    X = df[config.RAW_INPUT_FEATURES].copy()     # uniquement les informations connues à la réservation
+    y = df[config.TARGET].astype(int).copy()     # 1 = annulée, 0 = maintenue
     return X, y
 
 
-def train_test_data(X: pd.DataFrame, y: pd.Series):
-    """Division 80 / 20 stratifiée sur la cible pour conserver le taux d'annulation."""
-    return train_test_split(
+def train_test_data(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Division 80 / 20 stratifiée sur la cible pour conserver le taux d'annulation.
+
+    stratify=y : l'entraînement et le test gardent tous deux environ 28 %
+    d'annulations. random_state fixe le tirage pour que les résultats soient
+    reproductibles d'une exécution à l'autre.
+    """
+    X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
         test_size=config.TEST_SIZE,
         stratify=y,
         random_state=config.RANDOM_STATE,
+    )
+    # cast : train_test_split renvoie une liste sans type précis ; on indique à
+    # l'éditeur (VS Code) qu'il s'agit bien de DataFrame et de Series
+    return (
+        cast(pd.DataFrame, X_train),
+        cast(pd.DataFrame, X_test),
+        cast(pd.Series, y_train),
+        cast(pd.Series, y_test),
     )

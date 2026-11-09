@@ -14,9 +14,7 @@ __pycache__/
 # Données brutes (16 Mo, téléchargées automatiquement par src/data_loader.py)
 data/raw/*.csv
 
-# Modèles entraînés (régénérés par le notebook ou python -m src.train)
-models/*
-!models/.gitkeep
+# Les modèles entraînés (models/) SONT versionnés : l'application se lance dès le clonage
 
 # Système et éditeurs
 .DS_Store

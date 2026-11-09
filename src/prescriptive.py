@@ -1,222 +1,409 @@
 """Analyse prescriptive : passer de « qui va annuler ? » à « que faut-il faire ? ».
 
-Le modèle prédictif donne une probabilité d'annulation p. Ce module la
-transforme en décisions chiffrées, à partir d'hypothèses de coûts que
-l'utilisateur peut modifier (dans l'application Streamlit notamment).
+Utilisé par notebooks/02_analyse_prescriptive.ipynb et app/app.py.
 
-Trois outils de décision
-------------------------
-1. Seuil de décision optimal : au lieu du seuil arbitraire de 0,5, on choisit
-   le seuil qui minimise le coût total des erreurs :
-       coût = FN x coût d'une annulation non anticipée
-            + FP x coût d'une intervention inutile
-2. Action recommandée par réservation : parmi un catalogue d'actions
-   (rappel, offre, dépôt...), on retient celle qui maximise le gain net
-   espéré :
-       gain = p x revenu x efficacité            (annulations évitées)
-            - coût de l'action
-            - (1 - p) x revenu x désistement     (bons clients perdus, car
-                                                  une demande de prépaiement
-                                                  peut faire fuir un client
-                                                  qui serait venu)
-3. Surréservation optimale pour une date : à partir des probabilités de
-   chaque réservation, on calcule la distribution exacte du nombre de clients
-   présents (loi de Poisson binomiale) et le nombre de réservations
-   supplémentaires qui maximise le profit espéré :
-       profit = revenu x E[chambres occupées] - pénalité x E[clients relogés]
+Principe : aucun chiffre inventé
+--------------------------------
+Toutes les grandeurs sont calculées à partir des données :
+    * le moment des annulations (date d'annulation - date d'arrivée) ;
+    * le taux de revente des chambres annulées, estimé nuit par nuit à partir
+      de l'occupation réelle des hôtels ;
+    * le manque à gagner brut et net ;
+    * les seuils de décision (F2, F0,5) choisis par validation croisée.
+Seuls les NIVEAUX D'ACOMPTE sont des choix de l'hôtel : ils sont présentés
+comme des scénarios à comparer, jamais comme des faits.
 
-Limite importante : le modèle mesure une association, pas un effet causal.
-Les efficacités des actions sont des HYPOTHÈSES métier à valider par un
-test A/B ; elles ne sont pas estimées à partir des données.
+Ce qu'on ne peut PAS calculer : combien de clients fidèles renonceraient à
+réserver si on leur demandait un acompte (ils n'apparaissent pas dans les
+données). On calcule à la place le taux de fuite MAXIMAL acceptable : au-delà,
+l'acompte coûte plus qu'il ne rapporte.
+
+Remarque sur la fuite de données : l'analyse du moment des annulations
+utilise reservation_status_date, colonne exclue du modèle prédictif. Ici
+c'est légitime : on fait un bilan après coup, pas une prédiction.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import pandas as pd
+from sklearn.metrics import precision_recall_curve
 
-# ---------------------------------------------------------------------------
-# 1. Seuil de décision optimal
-# ---------------------------------------------------------------------------
+from src.data_loader import load_raw_data
+
+# ===========================================================================
+# 0. Tranches de délai d'annulation (5 catégories)
+# ===========================================================================
+# Délai = nombre de jours entre l'annulation et la date d'arrivée prévue.
+# Bornes en jours : [0, 7[, [7, 30[, [30, 60[, [60, 90[, [90, +inf[
+DELAY_BINS = [-np.inf, 7, 30, 60, 90, np.inf]
+DELAY_LABELS = [
+    "moins d'une semaine",
+    "1 semaine à 1 mois",
+    "1 à 2 mois",
+    "2 à 3 mois",
+    "plus de 3 mois",
+]
+
+MONTH_NUMBER = {
+    "January": 1, "February": 2, "March": 3, "April": 4, "May": 5, "June": 6,
+    "July": 7, "August": 8, "September": 9, "October": 10, "November": 11, "December": 12,
+}
 
 
-def cost_by_threshold(y_true, y_proba, cost_fn: float, cost_fp: float, thresholds=None) -> pd.DataFrame:
-    """Coût total des erreurs pour chaque seuil candidat."""
+def delay_category(delay_days) -> pd.Series:
+    """Range chaque délai (en jours) dans l'une des 5 tranches.
+
+    right=False : la borne de gauche est incluse (7 jours -> « 1 semaine à 1 mois »).
+    """
+    return pd.cut(pd.Series(delay_days), bins=DELAY_BINS, labels=DELAY_LABELS, right=False)
+
+
+def add_dates(df: pd.DataFrame) -> pd.DataFrame:
+    """Ajoute date d'arrivée, date de statut, délai d'annulation, nuits et revenu du séjour."""
+    df = df.copy()
+    # pd.to_datetime sur un DataFrame year / month / day : une date par ligne
+    df["arrival_date"] = pd.to_datetime(
+        pd.DataFrame({
+            "year": df["arrival_date_year"],
+            "month": df["arrival_date_month"].map(MONTH_NUMBER),
+            "day": df["arrival_date_day_of_month"],
+        })
+    )
+    df["status_date"] = pd.to_datetime(df["reservation_status_date"])
+    # Délai entre l'annulation et l'arrivée ; une absence (No-Show) donne 0 ou moins
+    df["cancel_delay"] = (df["arrival_date"] - df["status_date"]).dt.days.clip(lower=0)
+    df["nights"] = df["stays_in_weekend_nights"] + df["stays_in_week_nights"]
+    df["stay_revenue"] = revenue_at_risk(df["adr"], df["nights"])
+    df["delay_category"] = delay_category(df["cancel_delay"]).values
+    return df
+
+
+def revenue_at_risk(adr, total_nights):
+    """Revenu du séjour : tarif journalier x nombre de nuits (0 nuit compte pour 1)."""
+    return np.asarray(adr, dtype=float) * np.maximum(np.asarray(total_nights, dtype=float), 1)
+
+
+def load_all_bookings(raw: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Toutes les réservations, DOUBLONS COMPRIS, avec dates (bilan financier).
+
+    Pour compter des chambres et de l'argent, chaque ligne compte : deux lignes
+    identiques sont souvent deux vraies chambres réservées par un même groupe.
+    Seules les lignes impossibles (aucun client, tarif négatif ou > 5 000 €)
+    sont retirées, comme dans le nettoyage de base.
+    (Le modèle, lui, utilise les données sans doublons, pour que l'évaluation
+    ne soit pas faussée par des lignes identiques dans l'entraînement et le test.)
+    """
+    if raw is None:
+        raw = load_raw_data()
+    guests = raw["adults"] + raw["children"].fillna(0) + raw["babies"]
+    raw = raw[(guests > 0) & (raw["adr"] >= 0) & (raw["adr"] <= 5000)].reset_index(drop=True)
+    return add_dates(raw)
+
+
+# ===========================================================================
+# 1. Quand les clients annulent-ils ?
+# ===========================================================================
+def cancellation_timing(df: pd.DataFrame) -> pd.DataFrame:
+    """Répartition des annulations sans dépôt par tranche de délai.
+
+    df : réservations avec add_dates() déjà appliqué.
+    Colonnes : nombre d'annulations, part du total, part de réservations de
+    groupes, revenu brut des séjours annulés.
+    """
+    c = df[(df["is_canceled"] == 1) & (df["deposit_type"] == "No Deposit")]
+    table = c.groupby("delay_category", observed=False).agg(
+        annulations=("hotel", "size"),
+        part_groupes=("market_segment", lambda s: (s == "Groups").mean()),
+        nuitees=("nights", "sum"),
+        revenu_brut=("stay_revenue", "sum"),
+    )
+    table.insert(1, "part_annulations", table["annulations"] / table["annulations"].sum())
+    return table
+
+
+# ===========================================================================
+# 2. Taux de revente estimé à partir de l'occupation réelle
+# ===========================================================================
+def _explode_nights(df: pd.DataFrame) -> pd.DataFrame:
+    """Une ligne par nuit occupée (ou réservée) : (index de la réservation, hôtel, nuit)."""
+    nights = df["nights"].clip(lower=0).to_numpy()
+    idx = np.repeat(df.index.to_numpy(), nights)                       # index répété autant de fois que de nuits
+    offsets = np.concatenate([np.arange(n) for n in nights]) if len(df) else np.array([], dtype=int)
+    night = np.repeat(df["arrival_date"].to_numpy(), nights) + pd.to_timedelta(offsets, unit="D")
+    return pd.DataFrame({"i": idx, "hotel": np.repeat(df["hotel"].to_numpy(), nights), "night": night})
+
+
+def estimate_resale(raw: pd.DataFrame | None = None, capacity_quantile: float = 0.99):
+    """Estime, nuit par nuit, la part des chambres annulées qui ont été revendues.
+
+    Méthode
+    -------
+    1. Occupation réelle de chaque nuit = chambres des séjours réalisés.
+    2. Capacité de chaque hôtel = 99e centile de l'occupation observée
+       (le nombre de chambres n'est pas dans les données).
+    3. Une nuit donnée, les chambres annulées sont perdues dans la limite
+       des chambres restées vides ; le reste est considéré comme revendu :
+           perdues = min(chambres annulées, capacité - occupation)
+           taux de revente de la nuit = 1 - perdues / chambres annulées
+    4. Chaque annulation reçoit la moyenne des taux de ses nuits.
+
+    Données AVEC doublons : pour l'occupation, deux lignes identiques peuvent
+    être deux vraies chambres réservées par un même groupe.
+
+    Renvoie (taux par annulation, capacités estimées, table des nuits).
+    """
+    raw = load_all_bookings(raw)  # doublons conservés, lignes impossibles retirées
+
+    # 1. Occupation réelle par hôtel et par nuit
+    realised = _explode_nights(raw[raw["is_canceled"] == 0])
+    occupancy = realised.groupby(["hotel", "night"]).size().rename("occupees")
+
+    # 2. Capacité estimée
+    capacity = occupancy.groupby(level="hotel").quantile(capacity_quantile).round()
+
+    # 3. Chambres annulées (sans dépôt) par nuit
+    cancelled = raw[(raw["is_canceled"] == 1) & (raw["deposit_type"] == "No Deposit")]
+    cancelled_nights = _explode_nights(cancelled)
+    cancelled_count = cancelled_nights.groupby(["hotel", "night"]).size().rename("annulees")
+
+    nights = pd.concat([occupancy, cancelled_count], axis=1).fillna(0)
+    nights["capacite"] = nights.index.get_level_values("hotel").map(capacity.to_dict())
+    nights["vides"] = (nights["capacite"] - nights["occupees"]).clip(lower=0)
+    nights["perdues"] = np.minimum(nights["annulees"], nights["vides"])
+    nights["taux_revente"] = np.where(
+        nights["annulees"] > 0, 1 - nights["perdues"] / nights["annulees"].where(nights["annulees"] > 0, 1), np.nan
+    )
+
+    # 4. Taux moyen par annulation (moyenne sur ses nuits)
+    cancelled_nights = cancelled_nights.join(nights["taux_revente"], on=["hotel", "night"])
+    per_booking = cancelled_nights.groupby("i")["taux_revente"].mean()
+    cancelled = cancelled.assign(taux_revente=per_booking)
+    return cancelled, capacity, nights
+
+
+def resale_by_delay(cancelled: pd.DataFrame) -> pd.Series:
+    """Taux de revente moyen par tranche de délai (pondéré par le revenu du séjour)."""
+    c = cancelled.dropna(subset=["taux_revente"])
+    weighted = (c["taux_revente"] * c["stay_revenue"]).groupby(c["delay_category"], observed=False).sum()
+    return (weighted / c.groupby("delay_category", observed=False)["stay_revenue"].sum()).rename("taux_revente")
+
+
+def loss_table(timing: pd.DataFrame, resale: pd.Series) -> pd.DataFrame:
+    """Manque à gagner brut et net (après revente) par tranche de délai."""
+    table = timing.join(resale)
+    table["perte_nette"] = table["revenu_brut"] * (1 - table["taux_revente"])
+    table["part_perte_nette"] = table["perte_nette"] / table["perte_nette"].sum()
+    return table
+
+
+# ===========================================================================
+# 3. Scénarios d'acompte
+# ===========================================================================
+DEPOSIT_POLICIES = {
+    # nom : (type, valeur, remboursable jusqu'à N jours avant l'arrivée ou None)
+    "Première nuit": ("nuits", 1, None),
+    "20 % du séjour": ("part", 0.20, None),
+    "50 % du séjour": ("part", 0.50, None),
+    "50 %, remboursable jusqu'à 30 jours": ("part", 0.50, 30),
+    "100 %, remboursable jusqu'à 30 jours": ("part", 1.00, 30),
+}
+
+
+def deposit_amount(adr, nights, kind: str, value: float):
+    """Montant de l'acompte selon la politique : un nombre de nuits ou une part du séjour."""
+    revenue = revenue_at_risk(adr, nights)
+    if kind == "nuits":
+        return np.minimum(np.asarray(adr, dtype=float) * value, revenue)  # pas plus que le séjour
+    return revenue * value
+
+
+def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, policies: dict | None = None) -> pd.DataFrame:
+    """Bilan de chaque politique d'acompte appliquée aux réservations signalées.
+
+    bookings : réservations (avec add_dates) contenant is_canceled
+    flagged  : masque booléen des réservations à qui on demande un acompte
+    resale   : taux de revente par tranche de délai (resale_by_delay)
+
+    Pour chaque politique :
+      * perte nette sans acompte = revenu x (1 - taux de revente de la tranche)
+      * acompte conservé : seulement pour les annulations, et seulement si
+        l'annulation tombe après la date limite de remboursement
+      * perte nette restante = perte nette - acompte conservé
+      * clients fidèles exposés = réservations signalées qui ne sont PAS annulées
+      * taux de fuite maximal acceptable = acompte conservé / revenu des
+        fidèles exposés : si une plus grande part des fidèles renonce à
+        réserver, l'acompte coûte plus qu'il ne rapporte
+
+    L'acompte est conservé même si la chambre est revendue : la part couverte
+    peut donc dépasser 100 % (l'hôtel gagne alors plus que ce qu'il perdait).
+    Un taux de fuite maximal supérieur à 100 % signifie que l'acompte resterait
+    rentable même si TOUS les fidèles exposés renonçaient.
+    """
+    policies = policies or DEPOSIT_POLICIES
+    b = bookings.loc[np.asarray(flagged)].copy()
+    cancelled = b["is_canceled"] == 1
+    # Taux de revente associé à la tranche de délai de chaque annulation
+    rate = b["delay_category"].map(resale).astype(float).fillna(float(resale.mean()))
+    net_loss = (b["stay_revenue"] * (1 - rate)).where(cancelled, 0.0)
+    loyal_revenue = b.loc[~cancelled, "stay_revenue"].sum()
+
+    rows = []
+    for name, (kind, value, refundable_until) in policies.items():
+        amount = deposit_amount(b["adr"], b["nights"], kind, value)
+        kept = cancelled.copy()
+        if refundable_until is not None:
+            # Remboursé si l'annulation a lieu tôt : conservé seulement en cas d'annulation tardive
+            kept &= b["cancel_delay"] < refundable_until
+        recovered = float(amount[kept.to_numpy()].sum())
+        rows.append(
+            {
+                "politique": name,
+                "reservations_signalees": len(b),
+                "annulations_signalees": int(cancelled.sum()),
+                "perte_nette_sans_acompte": float(net_loss.sum()),
+                "acompte_conserve": recovered,
+                "perte_nette_restante": float(net_loss.sum()) - recovered,
+                "part_perte_couverte": recovered / float(net_loss.sum()) if net_loss.sum() else 0.0,
+                "fideles_exposes": int((~cancelled).sum()),
+                "taux_fuite_max_acceptable": recovered / loyal_revenue if loyal_revenue else np.nan,
+            }
+        )
+    return pd.DataFrame(rows).set_index("politique")
+
+
+# ===========================================================================
+# 4. Seuils de décision F-beta et action graduée
+# ===========================================================================
+def fbeta_by_threshold(y_true, y_proba, betas=(0.5, 1, 2)) -> pd.DataFrame:
+    """Précision, rappel et F-beta pour chaque seuil possible."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+    # precision et recall ont un élément de plus que thresholds : on retire le dernier
+    table = pd.DataFrame({"seuil": thresholds, "precision": precision[:-1], "rappel": recall[:-1]})
+    for beta in betas:
+        b2 = beta**2
+        denom = b2 * table["precision"] + table["rappel"]
+        # where : évite la division par zéro quand précision et rappel sont nuls
+        table[f"f{beta:g}"] = np.where(
+            denom > 0, (1 + b2) * table["precision"] * table["rappel"] / denom.where(denom > 0, 1), 0.0
+        )
+    return table
+
+
+def best_threshold(y_true, y_proba, beta: float) -> float:
+    """Seuil qui maximise le F-beta (beta > 1 : rappel prioritaire ; beta < 1 : précision)."""
+    table = fbeta_by_threshold(y_true, y_proba, betas=(beta,))
+    meilleur = int(table[f"f{beta:g}"].to_numpy().argmax())  # position du F-beta maximal
+    return float(table["seuil"].iloc[meilleur])
+
+
+def threshold_summary(y_true, y_proba, thresholds) -> pd.DataFrame:
+    """Matrice de confusion résumée pour quelques seuils (lecture métier)."""
     y_true = np.asarray(y_true)
     y_proba = np.asarray(y_proba)
-    thresholds = np.linspace(0.05, 0.95, 91) if thresholds is None else np.asarray(thresholds)
     rows = []
     for t in thresholds:
-        pred = y_proba >= t
-        fn = int(((~pred) & (y_true == 1)).sum())
-        fp = int((pred & (y_true == 0)).sum())
-        tp = int((pred & (y_true == 1)).sum())
+        alert = y_proba >= t                       # réservations signalées
+        tp = int((alert & (y_true == 1)).sum())    # annulations détectées
+        fp = int((alert & (y_true == 0)).sum())    # fidèles signalés à tort
+        fn = int((~alert & (y_true == 1)).sum())   # annulations ratées
         rows.append(
             {
                 "seuil": round(float(t), 3),
-                "faux_negatifs": fn,
-                "faux_positifs": fp,
-                "vrais_positifs": tp,
-                "rappel": tp / max(tp + fn, 1),
+                "alertes": int(alert.sum()),
+                "vraies_annulations": tp,
+                "fideles_signales": fp,
+                "annulations_ratees": fn,
                 "precision": tp / max(tp + fp, 1),
-                "cout_total": fn * cost_fn + fp * cost_fp,
+                "rappel": tp / max(tp + fn, 1),
             }
         )
     return pd.DataFrame(rows)
 
 
-def optimal_threshold(y_true, y_proba, cost_fn: float, cost_fp: float) -> tuple[float, pd.DataFrame]:
-    table = cost_by_threshold(y_true, y_proba, cost_fn, cost_fp)
-    best = table.loc[table["cout_total"].idxmin()]
-    return float(best["seuil"]), table
+ACTIONS = {
+    "Faible": ("Aucune action", "Confirmation automatique standard."),
+    "Modéré": (
+        "Relance sans engagement",
+        "Rappel par courriel et SMS avec un lien pour confirmer ou annuler en un clic, "
+        "sans acompte : une annulation anticipée se revend mieux.",
+    ),
+    "Élevé": (
+        "Acompte et surréservation",
+        "Acompte demandé (politique choisie par l'hôtel) et chambre comptée dans la marge "
+        "de surréservation de la date d'arrivée.",
+    ),
+}
 
 
-# ---------------------------------------------------------------------------
-# 2. Action recommandée par réservation
-# ---------------------------------------------------------------------------
+def risk_level(p: float, low: float, high: float) -> str:
+    """Zone de risque : faible sous le seuil F2, élevé au-dessus du seuil F0,5."""
+    if p >= high:
+        return "Élevé"
+    if p >= low:
+        return "Modéré"
+    return "Faible"
 
 
-@dataclass
-class Action:
-    nom: str
-    cout: float         # coût unitaire de l'action (€ par réservation)
-    efficacite: float   # part supposée des annulations évitées (0 à 1)
-    desistement: float  # part supposée des clients fidèles perdus à cause de l'action (0 à 1)
-    description: str
-
-
-def default_actions() -> list[Action]:
-    """Catalogue d'actions par défaut. Valeurs = hypothèses modifiables."""
-    return [
-        Action("Aucune action", 0.0, 0.00, 0.00, "Confirmation automatique standard."),
-        Action(
-            "Rappel personnalisé",
-            2.0,
-            0.10,
-            0.00,
-            "Courriel et SMS de rappel avant l'arrivée, avec lien de confirmation.",
-        ),
-        Action(
-            "Offre de fidélisation",
-            15.0,
-            0.25,
-            0.00,
-            "Avantage conditionné à la confirmation (petit-déjeuner, surclassement, départ tardif).",
-        ),
-        Action(
-            "Demande de prépaiement partiel",
-            5.0,
-            0.35,
-            0.05,
-            "Acompte ou passage à un tarif non remboursable avec remise.",
-        ),
-    ]
-
-
-def revenue_at_risk(adr, total_nights, resale_rate: float = 0.3):
-    """Revenu perdu si la réservation est annulée.
-
-    resale_rate : part des chambres annulées que l'hôtel parvient à revendre
-    (une annulation tardive est rarement revendue).
-    """
-    return np.asarray(adr) * np.maximum(np.asarray(total_nights), 1) * (1 - resale_rate)
-
-
-def recommend_actions(proba, revenue, actions: list[Action] | None = None) -> pd.DataFrame:
-    """Pour chaque réservation, choisit l'action au gain net espéré maximal."""
-    actions = actions or default_actions()
+def recommend_actions(proba, revenue, low: float, high: float) -> pd.DataFrame:
+    """Zone de risque, action recommandée et perte espérée pour chaque réservation."""
     proba = np.asarray(proba, dtype=float)
     revenue = np.asarray(revenue, dtype=float)
-    gains = np.column_stack(
-        [proba * revenue * a.efficacite - a.cout - (1 - proba) * revenue * a.desistement for a in actions]
-    )
-    best = gains.argmax(axis=1)
+    levels = [risk_level(p, low, high) for p in proba]
     return pd.DataFrame(
         {
             "proba_annulation": proba,
             "revenu_en_jeu": revenue,
-            "perte_esperee": proba * revenue,
-            "action_recommandee": [actions[i].nom for i in best],
-            "gain_net_espere": gains[np.arange(len(best)), best],
+            "perte_esperee": proba * revenue,   # sert à prioriser à risque égal
+            "niveau_risque": levels,
+            "action_recommandee": [ACTIONS[lvl][0] for lvl in levels],
         }
     )
 
 
-def risk_level(p: float, low: float = 0.3, high: float = 0.6) -> str:
-    if p >= high:
-        return "Élevé"
-    if p >= low:
-        return "Moyen"
-    return "Faible"
-
-
-# ---------------------------------------------------------------------------
-# 3. Surréservation optimale
-# ---------------------------------------------------------------------------
-
-
+# ===========================================================================
+# 5. Surréservation par niveau de service
+# ===========================================================================
 def show_distribution(p_cancel) -> np.ndarray:
-    """Loi exacte du nombre de clients présents (Poisson binomiale).
+    """Loi exacte du nombre de clients présents (loi de Poisson binomiale).
 
-    Chaque réservation i se présente avec la probabilité (1 - p_i), de façon
-    indépendante. Calcul par programmation dynamique (convolution successive).
-    dist[k] = P(exactement k clients présents).
+    Chaque réservation i se présente avec la probabilité (1 - p_i). On ajoute
+    les réservations une par une : dist[k] = P(exactement k présents).
     """
     dist = np.array([1.0])
     for p in np.asarray(p_cancel, dtype=float):
-        q = 1.0 - p  # probabilité de présence
         new = np.zeros(len(dist) + 1)
-        new[:-1] += dist * p
-        new[1:] += dist * q
+        new[:-1] += dist * p          # annulation : le nombre de présents ne change pas
+        new[1:] += dist * (1.0 - p)   # le client vient : un présent de plus
         dist = new
     return dist
 
 
-def overbooking_plan(
-    p_cancel_existing,
-    capacity: int,
-    p_cancel_new: float,
-    room_revenue: float,
-    walk_cost: float,
-    max_extra: int = 40,
-) -> pd.DataFrame:
-    """Profit espéré selon le nombre k de réservations acceptées au-delà de la capacité.
-
-    p_cancel_existing : probabilités prédites des réservations déjà au carnet
-    capacity          : nombre de chambres disponibles
-    p_cancel_new      : probabilité d'annulation supposée des réservations ajoutées
-    room_revenue      : revenu d'une chambre occupée (€ pour le séjour)
-    walk_cost         : pénalité si un client présent n'a pas de chambre
-                        (relogement, dédommagement, atteinte à la réputation)
-    """
+def overbooking_plan(p_cancel_existing, capacity: int, p_cancel_new: float, max_extra: int = 40) -> pd.DataFrame:
+    """Effet de k réservations acceptées au-delà de la capacité, pour k = 0 à max_extra."""
     p_cancel_existing = np.asarray(p_cancel_existing, dtype=float)
-    base_overbook = max(len(p_cancel_existing) - capacity, 0)
     rows = []
-    for k in range(0, max_extra + 1):
+    for k in range(max_extra + 1):
         probs = np.concatenate([p_cancel_existing, np.full(k, p_cancel_new)])
         dist = show_distribution(probs)
-        shows = np.arange(len(dist))
-        occupied = np.minimum(shows, capacity)
-        walked = np.maximum(shows - capacity, 0)
+        shows = np.arange(len(dist))                 # nombres de présents possibles
+        occupied = np.minimum(shows, capacity)       # pas plus que la capacité
+        walked = np.maximum(shows - capacity, 0)     # présents sans chambre
         exp_occ = float((dist * occupied).sum())
-        exp_walk = float((dist * walked).sum())
         rows.append(
             {
                 "reservations_supplementaires": k,
-                "reservations_totales": len(probs),
-                "surreservation_totale": base_overbook + k,
                 "presents_esperes": float((dist * shows).sum()),
                 "chambres_occupees_esperees": exp_occ,
                 "taux_occupation_espere": exp_occ / capacity if capacity else 0.0,
-                "clients_reloges_esperes": exp_walk,
+                "clients_reloges_esperes": float((dist * walked).sum()),
                 "prob_au_moins_un_reloge": float(dist[shows > capacity].sum()),
-                "profit_espere": room_revenue * exp_occ - walk_cost * exp_walk,
             }
         )
     return pd.DataFrame(rows)
 
 
-def best_overbooking(plan: pd.DataFrame) -> pd.Series:
-    return plan.loc[plan["profit_espere"].idxmax()]
+def max_safe_overbooking(plan: pd.DataFrame, max_walk_prob: float) -> pd.Series:
+    """Plus grand k dont la probabilité de reloger au moins un client reste <= max_walk_prob."""
+    safe = plan[plan["prob_au_moins_un_reloge"] <= max_walk_prob]
+    return safe.iloc[-1] if len(safe) else plan.iloc[0]

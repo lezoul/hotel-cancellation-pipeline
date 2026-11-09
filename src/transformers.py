@@ -1,33 +1,34 @@
-"""Transformateurs personnalisés compatibles scikit-learn (Partie 3).
+"""Transformateurs personnalisés (Partie 3), sur le modèle du cours (NormaliseurMinMax).
 
-Chaque classe hérite de BaseEstimator (pour get_params / set_params, donc
-compatible avec GridSearchCV et clone) et de TransformerMixin (qui fournit
-fit_transform). Chaque classe implémente :
+Ce qu'on écrit soi-même (« méthodes à programmer » du cours)
+------------------------------------------------------------
+- __init__(...)    : mémorise les paramètres, sans calcul
+- fit(X, y=None)   : apprend ce qui doit l'être sur l'entraînement, retourne self
+- transform(X)     : copie X, applique la règle, retourne la copie
 
-- fit(X, y=None)              : apprend ce qui doit l'être sur l'entraînement
-- transform(X)                : applique la transformation
-- get_feature_names_out(...)  : noms des colonnes produites (traçabilité et
-                                compatibilité avec set_output(transform="pandas"))
+Ce qui est fourni par scikit-learn (outils natifs, non réécrits)
+---------------------------------------------------------------
+- TransformerMixin      : fit_transform() = fit() puis transform()
+- BaseEstimator         : get_params() / set_params(), indispensables pour clone(),
+                          la validation croisée et RandomizedSearchCV
+- OneToOneFeatureMixin  : get_feature_names_out() pour un transformateur qui garde
+                          les mêmes colonnes (noms conservés dans la sortie pandas)
+- validate_data()       : appelé dans fit(), enregistre les noms et le nombre de
+                          colonnes d'entrée (feature_names_in_, n_features_in_)
 
-Trois transformateurs :
+Seule exception : HotelFeatureEngineer CRÉE de nouvelles colonnes. Aucun outil
+natif ne peut deviner leurs noms, donc get_feature_names_out() y est écrit à la main.
 
-1. HotelFeatureEngineer : crée des variables métier (durée totale, nombre de
-   clients, saison, présence d'une agence ou d'une entreprise, tarif par
-   personne) et corrige les modalités « Undefined ».
-2. RareCategoryGrouper  : regroupe les modalités rares (ex. 170+ pays) dans
-   « Autre », seuil appris sur l'entraînement.
-3. OutlierCapper        : écrête les valeurs extrêmes aux centiles appris sur
-   l'entraînement (winsorisation), au lieu de supprimer des lignes.
+Ces classes sont utilisées comme étapes dans src/pipelines.py.
 """
-
-from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils.validation import check_is_fitted
+from sklearn.base import BaseEstimator, OneToOneFeatureMixin, TransformerMixin
+from sklearn.utils.validation import validate_data
 
-SEASON_BY_MONTH = {
+# Correspondance mois -> saison (saisons météorologiques, hémisphère nord)
+SAISON_PAR_MOIS = {
     "December": "Hiver", "January": "Hiver", "February": "Hiver",
     "March": "Printemps", "April": "Printemps", "May": "Printemps",
     "June": "Ete", "July": "Ete", "August": "Ete",
@@ -35,181 +36,153 @@ SEASON_BY_MONTH = {
 }
 
 
-def _to_frame(X, columns=None) -> pd.DataFrame:
-    """Garantit un DataFrame (le pipeline peut transmettre un tableau NumPy)."""
-    if isinstance(X, pd.DataFrame):
-        return X.copy()
-    return pd.DataFrame(X, columns=columns)
-
-
-class HotelFeatureEngineer(BaseEstimator, TransformerMixin):
-    """Ingénierie des caractéristiques propre au domaine hôtelier.
+# ===========================================================================
+# 1. HotelFeatureEngineer : création de variables métier
+# ===========================================================================
+class HotelFeatureEngineer(TransformerMixin, BaseEstimator):
+    """Crée des variables métier et corrige les modalités « Undefined ».
 
     Variables créées
-    ----------------
-    total_nights    : nuits de semaine + nuits de fin de semaine
-    total_guests    : adultes + enfants + bébés
-    adr_per_person  : tarif journalier moyen divisé par le nombre de clients
-    has_children    : 1 si au moins un enfant ou un bébé
-    has_agent       : 1 si la réservation passe par une agence (agent renseigné)
-    has_company     : 1 si une entreprise paie la réservation (company renseigné)
-    arrival_season  : saison d'arrivée déduite du mois
-
+        total_nights    = nuits de semaine + nuits de fin de semaine
+        total_guests    = adultes + enfants + bébés
+        adr_per_person  = tarif journalier / nombre de clients
+        has_children    = 1 si au moins un enfant ou un bébé
+        has_agent       = 1 si réservation via une agence (agent renseigné)
+        has_company     = 1 si séjour payé par une entreprise (company renseigné)
+        arrival_season  = saison déduite du mois d'arrivée
     Corrections
-    -----------
-    meal « Undefined » -> « SC » (la fiche TidyTuesday indique qu'ils sont équivalents)
-    market_segment / distribution_channel « Undefined » -> NaN (imputés ensuite)
-
+        meal « Undefined » -> « SC » (équivalents selon la fiche des données)
+        market_segment, distribution_channel « Undefined » -> valeur manquante
     Colonnes retirées
-    -----------------
-    agent, company : identifiants numériques sans ordre (352 entreprises, 94 %
-    de manquants). Seule l'information « présent / absent » est conservée.
+        agent, company : identifiants sans ordre ; seule leur présence compte
 
-    Paramètres
-    ----------
-    drop_ids : bool, défaut True
-        Retirer les identifiants agent et company après création des indicateurs.
+    Comme SalaireAnnuel dans le cours, fit() n'apprend aucune statistique :
+    la règle est fixe.
     """
 
-    def __init__(self, drop_ids: bool = True):
-        self.drop_ids = drop_ids
+    # Attributs remplis dans fit() par l'outil natif validate_data() ;
+    # déclarés ici pour que l'éditeur (VS Code) les connaisse.
+    feature_names_in_: np.ndarray
+    n_features_in_: int
 
-    def _engineer(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = _to_frame(X)
-
-        X["meal"] = X["meal"].replace("Undefined", "SC")
-        for col in ("market_segment", "distribution_channel"):
-            X[col] = X[col].replace("Undefined", np.nan)
-
-        children = pd.to_numeric(X["children"], errors="coerce").fillna(0)
-        babies = pd.to_numeric(X["babies"], errors="coerce").fillna(0)
-        adults = pd.to_numeric(X["adults"], errors="coerce").fillna(0)
-
-        X["total_nights"] = X["stays_in_weekend_nights"] + X["stays_in_week_nights"]
-        X["total_guests"] = adults + children + babies
-        # .clip(lower=1) évite la division par zéro sans perdre la ligne
-        X["adr_per_person"] = X["adr"] / X["total_guests"].clip(lower=1)
-        X["has_children"] = ((children + babies) > 0).astype(int)
-        X["has_agent"] = X["agent"].notna().astype(int)
-        X["has_company"] = X["company"].notna().astype(int)
-        X["arrival_season"] = X["arrival_date_month"].map(SEASON_BY_MONTH)
-
-        if self.drop_ids:
-            X = X.drop(columns=["agent", "company"])
-        return X
+    def __init__(self, supprimer_identifiants=True):
+        # Paramètre : retirer ou non agent et company après création des indicateurs
+        self.supprimer_identifiants = supprimer_identifiants
 
     def fit(self, X, y=None):
-        X = _to_frame(X)
-        self.feature_names_in_ = np.array(X.columns, dtype=object)
-        self.n_features_in_ = X.shape[1]
-        self.feature_names_out_ = np.array(self._engineer(X.head(2)).columns, dtype=object)
-        return self
+        # Outil natif : mémorise les noms et le nombre de colonnes d'entrée
+        validate_data(self, X, dtype=None, ensure_all_finite=False)
+        return self  # retourne l'objet lui-même pour l'intégration dans un pipeline
 
     def transform(self, X):
-        check_is_fitted(self, "feature_names_out_")
-        return self._engineer(X)
+        X_ = pd.DataFrame(X).copy()  # copie pour ne pas modifier les données originales
+
+        # --- Corrections des modalités « Undefined » ---
+        X_["meal"] = X_["meal"].replace("Undefined", "SC")
+        X_["market_segment"] = X_["market_segment"].replace("Undefined", np.nan)
+        X_["distribution_channel"] = X_["distribution_channel"].replace("Undefined", np.nan)
+
+        # --- Nombre de clients (un enfant manquant compte pour 0) ---
+        enfants = X_["children"].fillna(0)
+        X_["total_guests"] = X_["adults"] + enfants + X_["babies"]
+
+        # --- Nouvelles variables ---
+        X_["total_nights"] = X_["stays_in_weekend_nights"] + X_["stays_in_week_nights"]
+        # clip(lower=1) évite la division par zéro sans perdre la ligne
+        X_["adr_per_person"] = X_["adr"] / X_["total_guests"].clip(lower=1)
+        X_["has_children"] = ((enfants + X_["babies"]) > 0).astype(int)  # True/False -> 1/0
+        X_["has_agent"] = X_["agent"].notna().astype(int)
+        X_["has_company"] = X_["company"].notna().astype(int)
+        X_["arrival_season"] = X_["arrival_date_month"].map(SAISON_PAR_MOIS)
+
+        # --- Retrait des identifiants, remplacés par les indicateurs ---
+        if self.supprimer_identifiants:
+            X_ = X_.drop(columns=["agent", "company"])
+        return X_
 
     def get_feature_names_out(self, input_features=None):
-        check_is_fitted(self, "feature_names_out_")
-        return self.feature_names_out_
+        # Seule méthode non native : les noms des colonnes CRÉÉES ne peuvent pas
+        # être devinés par scikit-learn. Sortie = colonnes d'entrée - identifiants + créées.
+        colonnes = list(self.feature_names_in_)
+        if self.supprimer_identifiants:
+            colonnes = [c for c in colonnes if c not in ("agent", "company")]
+        creees = ["total_guests", "total_nights", "adr_per_person",
+                  "has_children", "has_agent", "has_company", "arrival_season"]
+        return np.array(colonnes + creees, dtype=object)
 
 
-class RareCategoryGrouper(BaseEstimator, TransformerMixin):
-    """Regroupe les modalités peu fréquentes d'une variable catégorielle.
+# ===========================================================================
+# 2. RareCategoryGrouper : regroupement des modalités rares
+# ===========================================================================
+class RareCategoryGrouper(OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
+    """Regroupe dans « Autre » les modalités trop peu fréquentes.
 
-    Pourquoi : country compte plus de 170 pays dont la majorité représente
-    moins de 0,5 % des réservations. Un encodage one-hot direct créerait
-    des dizaines de colonnes presque vides, sources de bruit et de
-    surapprentissage. Les modalités rares sont regroupées dans « Autre ».
-
-    Les modalités conservées sont apprises dans fit (sur l'entraînement
-    seulement). Une modalité jamais vue en entraînement devient aussi
-    « Autre » au moment de la prédiction, ce qui rend le pipeline robuste.
-
-    Paramètres
-    ----------
-    min_freq : float, défaut 0.005
-        Fréquence relative minimale pour qu'une modalité soit conservée.
-    other_label : str, défaut "Autre"
-        Libellé de la modalité de regroupement.
+    country compte 177 pays dont 157 pèsent chacun moins de 0,5 % des
+    réservations : un encodage one-hot direct créerait des dizaines de
+    colonnes presque vides. Les modalités fréquentes sont APPRISES dans fit()
+    (sur l'entraînement) ; toute autre modalité, y compris une modalité jamais
+    vue, devient « Autre » dans transform().
     """
 
-    def __init__(self, min_freq: float = 0.005, other_label: str = "Autre"):
-        self.min_freq = min_freq
-        self.other_label = other_label
+    # Attributs remplis dans fit() par l'outil natif validate_data() ;
+    # déclarés ici pour que l'éditeur (VS Code) les connaisse.
+    feature_names_in_: np.ndarray
+    n_features_in_: int
+
+    def __init__(self, min_freq=0.005, autre="Autre"):
+        self.min_freq = min_freq  # fréquence minimale pour garder une modalité
+        self.autre = autre        # libellé de regroupement
 
     def fit(self, X, y=None):
-        X = _to_frame(X)
-        self.feature_names_in_ = np.array(X.columns, dtype=object)
-        self.n_features_in_ = X.shape[1]
-        self.frequent_categories_ = {}
+        validate_data(self, X, dtype=None, ensure_all_finite=False)  # outil natif
+        X = pd.DataFrame(X, columns=self.feature_names_in_)
+        # Étape d'apprentissage : pour chaque colonne, les modalités assez fréquentes
+        self.modalites_frequentes_ = {}
         for col in X.columns:
-            freq = X[col].value_counts(normalize=True, dropna=True)
-            self.frequent_categories_[col] = set(freq[freq >= self.min_freq].index)
+            freq = X[col].value_counts(normalize=True)  # fréquences relatives
+            self.modalites_frequentes_[col] = set(freq[freq >= self.min_freq].index)
         return self
 
     def transform(self, X):
-        check_is_fitted(self, "frequent_categories_")
-        X = _to_frame(X, columns=self.feature_names_in_)
-        for col, keep in self.frequent_categories_.items():
-            values = X[col].astype(object)
-            X[col] = values.where(values.isin(keep) | values.isna(), self.other_label)
-        return X
-
-    def get_feature_names_out(self, input_features=None):
-        check_is_fitted(self, "frequent_categories_")
-        return self.feature_names_in_
-
-    def grouped_summary(self) -> pd.DataFrame:
-        """Nombre de modalités conservées par variable (pour le rapport)."""
-        check_is_fitted(self, "frequent_categories_")
-        return pd.DataFrame(
-            {
-                "variable": list(self.frequent_categories_),
-                "modalites_conservees": [len(v) for v in self.frequent_categories_.values()],
-            }
-        )
+        X_ = pd.DataFrame(X, columns=self.feature_names_in_).copy()
+        # Étape de transformation : modalité non apprise -> « Autre »
+        for col, garder in self.modalites_frequentes_.items():
+            valeurs = X_[col].astype(object)
+            # where(condition, autre) : garde la valeur si la condition est vraie
+            X_[col] = valeurs.where(valeurs.isin(garder) | valeurs.isna(), self.autre)
+        return X_
 
 
-class OutlierCapper(BaseEstimator, TransformerMixin):
-    """Écrête (winsorise) les valeurs extrêmes aux centiles appris.
+# ===========================================================================
+# 3. OutlierCapper : écrêtage des valeurs extrêmes
+# ===========================================================================
+class OutlierCapper(OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
+    """Ramène les valeurs extrêmes aux centiles appris (winsorisation).
 
-    Pourquoi : lead_time monte à 737 jours, les séjours à 69 nuits et adr
-    présente une queue très longue. Plutôt que de supprimer ces lignes
-    (perte d'information sur la cible), les valeurs sont ramenées aux bornes
-    [q_bas, q_haut] calculées sur l'entraînement. La standardisation qui
-    suit n'est ainsi plus dominée par quelques points extrêmes.
-
-    Paramètres
-    ----------
-    lower_quantile : float, défaut 0.01
-    upper_quantile : float, défaut 0.99
+    lead_time monte à 737 jours et adr a une longue queue. Plutôt que de
+    supprimer ces réservations, on les borne : même principe que le
+    NormaliseurMinMax du cours, fit() apprend une borne basse et une borne
+    haute par colonne, transform() les applique.
     """
 
-    def __init__(self, lower_quantile: float = 0.01, upper_quantile: float = 0.99):
-        self.lower_quantile = lower_quantile
-        self.upper_quantile = upper_quantile
+    # Attributs remplis dans fit() par l'outil natif validate_data() ;
+    # déclarés ici pour que l'éditeur (VS Code) les connaisse.
+    feature_names_in_: np.ndarray
+    n_features_in_: int
+
+    def __init__(self, lower_quantile=0.01, upper_quantile=0.99):
+        self.lower_quantile = lower_quantile  # 1er centile par défaut
+        self.upper_quantile = upper_quantile  # 99e centile par défaut
 
     def fit(self, X, y=None):
-        if not 0 <= self.lower_quantile < self.upper_quantile <= 1:
-            raise ValueError("Il faut 0 <= lower_quantile < upper_quantile <= 1.")
-        X = _to_frame(X).apply(pd.to_numeric, errors="coerce")
-        self.feature_names_in_ = np.array(X.columns, dtype=object)
-        self.n_features_in_ = X.shape[1]
-        self.lower_bounds_ = X.quantile(self.lower_quantile)
-        self.upper_bounds_ = X.quantile(self.upper_quantile)
+        validate_data(self, X, dtype=None, ensure_all_finite=False)  # outil natif
+        X = pd.DataFrame(X, columns=self.feature_names_in_)
+        # Étape d'apprentissage : bornes par colonne, mémorisées dans min_ et max_
+        self.min_ = X.quantile(self.lower_quantile)
+        self.max_ = X.quantile(self.upper_quantile)
         return self
 
     def transform(self, X):
-        check_is_fitted(self, "lower_bounds_")
-        X = _to_frame(X, columns=self.feature_names_in_).apply(pd.to_numeric, errors="coerce")
-        return X.clip(lower=self.lower_bounds_, upper=self.upper_bounds_, axis=1)
-
-    def get_feature_names_out(self, input_features=None):
-        check_is_fitted(self, "lower_bounds_")
-        return self.feature_names_in_
-
-    def bounds(self) -> pd.DataFrame:
-        """Bornes apprises par variable (pour le rapport)."""
-        check_is_fitted(self, "lower_bounds_")
-        return pd.DataFrame({"borne_basse": self.lower_bounds_, "borne_haute": self.upper_bounds_})
+        X_ = pd.DataFrame(X, columns=self.feature_names_in_).copy()
+        # Étape de transformation : chaque colonne bornée par SES propres limites
+        return X_.clip(lower=self.min_, upper=self.max_, axis=1)

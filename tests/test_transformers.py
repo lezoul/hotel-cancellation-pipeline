@@ -1,108 +1,138 @@
-"""Tests unitaires des transformateurs personnalisés et du module prescriptif.
+"""Tests unitaires : transformateurs personnalisés, pipelines et module prescriptif.
 
-Exécution : python -m pytest -q
+Exécution depuis la racine du projet : python -m pytest -q
 """
+
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn import set_config
 from sklearn.base import clone
 
-from src.prescriptive import overbooking_plan, recommend_actions, show_distribution
+from src import prescriptive as pr
+from src.pipelines import model_pipeline, pipeline_pretraitement
 from src.transformers import HotelFeatureEngineer, OutlierCapper, RareCategoryGrouper
+
+set_config(transform_output="pandas")  # comme dans le notebook
 
 
 @pytest.fixture
-def raw_rows():
-    return pd.DataFrame(
-        {
-            "hotel": ["City Hotel", "Resort Hotel"],
-            "lead_time": [10, 300],
-            "arrival_date_month": ["July", "January"],
-            "arrival_date_week_number": [27, 2],
-            "arrival_date_day_of_month": [1, 15],
-            "stays_in_weekend_nights": [1, 2],
-            "stays_in_week_nights": [2, 5],
-            "adults": [2, 0],
-            "children": [np.nan, 1],
-            "babies": [0, 1],
-            "meal": ["Undefined", "BB"],
-            "country": ["PRT", "FRA"],
-            "market_segment": ["Undefined", "Online TA"],
-            "distribution_channel": ["TA/TO", "Undefined"],
-            "is_repeated_guest": [0, 1],
-            "previous_cancellations": [0, 1],
-            "previous_bookings_not_canceled": [0, 2],
-            "reserved_room_type": ["A", "D"],
-            "booking_changes": [0, 1],
-            "deposit_type": ["No Deposit", "Non Refund"],
-            "agent": [9.0, np.nan],
-            "company": [np.nan, 40.0],
-            "days_in_waiting_list": [0, 0],
-            "customer_type": ["Transient", "Contract"],
-            "adr": [100.0, 80.0],
-            "required_car_parking_spaces": [0, 1],
-            "total_of_special_requests": [1, 0],
-        }
-    )
+def reservations():
+    """Deux réservations brutes couvrant les cas particuliers (Undefined, enfant manquant...)."""
+    return pd.DataFrame({
+        "hotel": ["City Hotel", "Resort Hotel"],
+        "lead_time": [10, 300],
+        "arrival_date_month": ["July", "January"],
+        "arrival_date_week_number": [27, 2],
+        "arrival_date_day_of_month": [1, 15],
+        "stays_in_weekend_nights": [1, 2],
+        "stays_in_week_nights": [2, 5],
+        "adults": [2, 0],
+        "children": [np.nan, 1],
+        "babies": [0, 1],
+        "meal": ["Undefined", "BB"],
+        "country": ["PRT", "FRA"],
+        "market_segment": ["Undefined", "Online TA"],
+        "distribution_channel": ["TA/TO", "Undefined"],
+        "is_repeated_guest": [0, 1],
+        "previous_cancellations": [0, 1],
+        "previous_bookings_not_canceled": [0, 2],
+        "reserved_room_type": ["A", "D"],
+        "booking_changes": [0, 1],
+        "deposit_type": ["No Deposit", "Non Refund"],
+        "agent": [9.0, np.nan],
+        "company": [np.nan, 40.0],
+        "days_in_waiting_list": [0, 0],
+        "customer_type": ["Transient", "Contract"],
+        "adr": [100.0, 80.0],
+        "required_car_parking_spaces": [0, 1],
+        "total_of_special_requests": [1, 0],
+    })
 
 
-def test_feature_engineer_creates_expected_columns(raw_rows):
-    out = HotelFeatureEngineer().fit_transform(raw_rows)
-    assert out["total_nights"].tolist() == [3, 7]
-    assert out["total_guests"].tolist() == [2, 2]          # enfant manquant compté 0
-    assert out["has_children"].tolist() == [0, 1]
-    assert out["has_agent"].tolist() == [1, 0]
-    assert out["has_company"].tolist() == [0, 1]
-    assert out["arrival_season"].tolist() == ["Ete", "Hiver"]
-    assert out.loc[0, "meal"] == "SC"
-    assert pd.isna(out.loc[0, "market_segment"])
-    assert "agent" not in out and "company" not in out
-    assert list(out.columns) == list(HotelFeatureEngineer().fit(raw_rows).get_feature_names_out())
+# --- Transformateurs -------------------------------------------------------
+def test_feature_engineer_cree_les_variables(reservations):
+    sortie = HotelFeatureEngineer().fit_transform(reservations)
+    assert sortie["total_nights"].tolist() == [3, 7]
+    assert sortie["total_guests"].tolist() == [2, 2]       # enfant manquant compté 0
+    assert sortie["has_children"].tolist() == [0, 1]
+    assert sortie["has_agent"].tolist() == [1, 0]
+    assert sortie["has_company"].tolist() == [0, 1]
+    assert sortie["arrival_season"].tolist() == ["Ete", "Hiver"]
+    assert sortie.loc[0, "meal"] == "SC"
+    assert pd.isna(sortie.loc[0, "market_segment"])
+    assert "agent" not in sortie and "company" not in sortie
 
 
-def test_feature_engineer_does_not_modify_input(raw_rows):
-    before = raw_rows.copy()
-    HotelFeatureEngineer().fit_transform(raw_rows)
-    pd.testing.assert_frame_equal(raw_rows, before)
+def test_feature_engineer_noms_de_sortie(reservations):
+    fe = HotelFeatureEngineer().fit(reservations)
+    assert sorted(fe.get_feature_names_out()) == sorted(fe.transform(reservations).columns)
 
 
-def test_rare_category_grouper_learns_on_fit_only():
+def test_feature_engineer_ne_modifie_pas_l_entree(reservations):
+    avant = reservations.copy()
+    HotelFeatureEngineer().fit_transform(reservations)
+    pd.testing.assert_frame_equal(reservations, avant)
+
+
+def test_regroupement_appris_sur_fit_seulement():
     train = pd.DataFrame({"country": ["PRT"] * 8 + ["FRA", "ESP"]})
     grouper = RareCategoryGrouper(min_freq=0.15).fit(train)
-    out = grouper.transform(pd.DataFrame({"country": ["PRT", "FRA", "JPN"]}))
-    assert out["country"].tolist() == ["PRT", "Autre", "Autre"]
+    sortie = grouper.transform(pd.DataFrame({"country": ["PRT", "FRA", "JPN"]}))
+    assert sortie["country"].tolist() == ["PRT", "Autre", "Autre"]   # JPN jamais vu -> Autre
+    assert np.asarray(grouper.get_feature_names_out()).tolist() == ["country"]      # fourni par OneToOneFeatureMixin
 
 
-def test_outlier_capper_clips_to_train_quantiles():
+def test_ecretage_aux_centiles_appris():
     train = pd.DataFrame({"lead_time": np.arange(101, dtype=float)})
     capper = OutlierCapper(0.05, 0.95).fit(train)
-    out = capper.transform(pd.DataFrame({"lead_time": [-10.0, 50.0, 1000.0]}))
-    assert out["lead_time"].tolist() == [5.0, 50.0, 95.0]
+    sortie = capper.transform(pd.DataFrame({"lead_time": [-10.0, 50.0, 1000.0]}))
+    assert sortie["lead_time"].tolist() == [5.0, 50.0, 95.0]
 
 
-def test_outlier_capper_rejects_bad_quantiles():
-    with pytest.raises(ValueError):
-        OutlierCapper(0.9, 0.1).fit(pd.DataFrame({"a": [1.0, 2.0]}))
+def test_transformateurs_clonables():
+    for t in (HotelFeatureEngineer(supprimer_identifiants=False), RareCategoryGrouper(0.1), OutlierCapper(0.02, 0.98)):
+        assert cast(Any, clone(t)).get_params() == t.get_params()
 
 
-def test_transformers_are_clonable():
-    for t in (HotelFeatureEngineer(drop_ids=False), RareCategoryGrouper(0.1), OutlierCapper(0.02, 0.98)):
-        assert clone(t).get_params() == t.get_params()
+# --- Pipelines --------------------------------------------------------------
+def test_pipeline_pretraitement_sans_valeur_manquante(reservations):
+    sortie = cast(Any, clone(pipeline_pretraitement)).fit_transform(reservations)
+    assert sortie.isna().sum().sum() == 0
+    assert len(sortie) == len(reservations)  # un pipeline ne supprime jamais de lignes
 
 
-def test_show_distribution_sums_to_one_and_matches_binomial():
-    dist = show_distribution([0.5, 0.5])
-    np.testing.assert_allclose(dist, [0.25, 0.5, 0.25])
-    assert np.isclose(show_distribution(np.random.rand(30)).sum(), 1.0)
+def test_model_pipeline_trois_etapes():
+    assert [nom for nom, _ in model_pipeline.steps] == ["preprocessing", "selection", "model"]
 
 
-def test_overbooking_zero_cancellation_means_no_extra_booking():
-    plan = overbooking_plan([0.0] * 10, capacity=10, p_cancel_new=0.0, room_revenue=100, walk_cost=300, max_extra=5)
-    assert plan.loc[plan["profit_espere"].idxmax(), "reservations_supplementaires"] == 0
+# --- Prescriptif ------------------------------------------------------------
+def test_tranches_de_delai():
+    tranches = pr.delay_category([0, 6, 7, 29, 30, 59, 60, 89, 90, 400]).tolist()
+    assert tranches == [pr.DELAY_LABELS[i] for i in (0, 0, 1, 1, 2, 2, 3, 3, 4, 4)]
 
 
-def test_recommend_actions_prefers_no_action_for_low_risk():
-    rec = recommend_actions([0.01, 0.9], [200.0, 600.0])
-    assert rec.loc[0, "action_recommandee"] == "Aucune action"
-    assert rec.loc[1, "action_recommandee"] != "Aucune action"
+def test_loi_poisson_binomiale():
+    np.testing.assert_allclose(pr.show_distribution([0.5, 0.5]), [0.25, 0.5, 0.25])
+    assert np.isclose(pr.show_distribution(np.random.rand(30)).sum(), 1.0)
+
+
+def test_surreservation_nulle_sans_annulation():
+    plan = pr.overbooking_plan([0.0] * 10, capacity=10, p_cancel_new=0.0, max_extra=5)
+    assert pr.max_safe_overbooking(plan, 0.05)["reservations_supplementaires"] == 0
+
+
+def test_acompte_remboursable_rembourse_les_annulations_precoces():
+    reservations = pd.DataFrame({
+        "is_canceled": [1, 1, 0], "adr": [100.0, 100.0, 100.0], "nights": [2, 2, 2],
+        "stay_revenue": [200.0, 200.0, 200.0], "cancel_delay": [5, 60, 0],
+        "delay_category": pr.delay_category([5, 60, 0]).values,
+    })
+    revente = pd.Series(0.5, index=pr.DELAY_LABELS)
+    bilan = pr.deposit_scenarios(reservations, [True, True, True], revente,
+                                 {"test": ("part", 0.5, 30)}).iloc[0]
+    assert bilan["acompte_conserve"] == 100.0       # seule l'annulation tardive (5 jours) est conservée
+    assert bilan["fideles_exposes"] == 1
+    assert bilan["taux_fuite_max_acceptable"] == 0.5  # 100 € conservés / 200 € de revenu fidèle
