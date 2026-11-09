@@ -122,7 +122,7 @@ Points de méthode :
 Prérequis : Python 3.11 ou plus récent (testé avec Python 3.13), Git.
 
 ```bash
-git clone https://github.com/<votre-compte>/hotel-cancellation-pipeline.git
+git clone https://github.com/lezoul/hotel-cancellation-pipeline.git
 cd hotel-cancellation-pipeline
 
 # Environnement virtuel
