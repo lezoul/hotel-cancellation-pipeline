@@ -27,7 +27,7 @@ Les deux seuils sont choisis par validation croisée **dans l'entraînement**. A
 | Combien coûtent les annulations sans dépôt ? | 13,1 M€ brut, mais **3,0 M€ net** après revente des chambres (11,7 % du revenu réalisé) |
 | Quand ont-elles lieu ? | 46 % dans le dernier mois avant l'arrivée, qui concentre 53 % de la perte nette |
 | Quelle part des chambres est revendue ? | de 61 % (annulation dans la dernière semaine) à 86 % (plus de 3 mois avant) |
-| Que rapporterait un acompte ? | demandé aux réservations sans dépôt au seuil F0,5, de 44 % à 140 % de la perte nette selon la politique, en ne touchant que 931 clients fidèles (ensemble de test) ; au seuil F2, il récupère plus mais touche 4 281 fidèles |
+| Que rapporterait un acompte ? | demandé aux réservations sans dépôt au seuil F0,5, de 44 % à 140 % de la perte nette selon la politique, en touchant 7,5 % des clients fidèles ; au seuil F2, il récupère plus mais touche 34,4 % des fidèles. Avec 20 % du séjour, F2 rapporte plus tant que moins de 9,4 % des fidèles renoncent, F0,5 au-delà |
 
 ---
 

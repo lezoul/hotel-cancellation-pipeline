@@ -357,28 +357,51 @@ with tab3:
 
     politique = {"choisie": (kind, valeur, remboursable or None)}
     res = pr.deposit_scenarios(test, test["proba"] >= seuil, revente, politique).iloc[0]
-    k1, k2, k3, k4 = st.columns(4)
+    k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric("Acompte conservé", euro(res["acompte_conserve"]),
               f"{res['part_perte_couverte']:.0%} de la perte nette", delta_color="off")
     k2.metric("Perte nette restante", euro(res["perte_nette_restante"]),
-              f"sur {euro(res['perte_nette_totale'])} de perte nette totale", delta_color="off")
-    k3.metric("Clients fidèles exposés", int(res["fideles_exposes"]),
-              f"sur {int(res['reservations_signalees'])} signalées", delta_color="off")
-    k4.metric("Taux de fuite maximal acceptable", f"{res['taux_fuite_max_acceptable']:.1%}",
-              help="Si une plus grande part des fidèles exposés renonce à réserver, l'acompte coûte plus qu'il ne rapporte")
+              f"sur {euro(res['perte_nette_totale'])} au départ", delta_color="off")
+    k3.metric("Annulations visées", int(res["annulations_signalees"]),
+              f"{res['part_annulations_visees']:.0%} de toutes les annulations", delta_color="off")
+    k4.metric("Clients fidèles touchés", int(res["fideles_exposes"]),
+              f"{res['part_fideles_touches']:.1%} de tous les fidèles", delta_color="off")
+    k5.metric("Fuite max. acceptable", f"{res['taux_fuite_max_acceptable']:.1%}",
+              help="Part des fidèles touchés qui peuvent renoncer avant que l'acompte coûte plus qu'il ne rapporte")
 
-    # Courbe : effet du seuil sur la couverture et le taux de fuite maximal acceptable
-    grille_seuils = np.round(np.arange(0.10, 0.96, 0.05), 2)
-    courbe = pd.concat(
-        [pr.deposit_scenarios(test, test["proba"] >= s, revente, politique).assign(seuil=s) for s in grille_seuils]
-    )
+    # Comparaison des seuils sur une échelle commune : le gain net selon la part des fidèles
+    # qui renoncent. Ce taux décrit la réaction des clients, pas le seuil : même axe pour tous.
+    st.markdown("##### Comparer les seuils : gain net selon la part des fidèles qui renoncent")
+    st.caption("Gain net = acompte conservé - revenu des clients fidèles perdus. La part des fidèles qui renoncent "
+               "devant un acompte est inconnue (seul un test A/B la mesurerait) ; elle est la même quel que soit le "
+               "seuil, ce qui permet de comparer les seuils sur le même axe.")
+    seuils_compares = {f"F0,5 = {SEUIL_F05:.3f}": SEUIL_F05, f"F2 = {SEUIL_F2:.3f}": SEUIL_F2}
+    if not (choix_seuil.startswith("F0,5") or choix_seuil.startswith("F2")):
+        seuils_compares[f"Seuil choisi = {seuil:.2f}"] = seuil
+    scenarios = {nom: pr.deposit_scenarios(test, test["proba"] >= s, revente, politique).iloc[0]
+                 for nom, s in seuils_compares.items()}
+    taux_fuite = np.linspace(0, 0.6, 61)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=courbe["seuil"], y=courbe["taux_fuite_max_acceptable"], name="Taux de fuite maximal acceptable", line_color=VERT))
-    fig.add_trace(go.Scatter(x=courbe["seuil"], y=courbe["part_perte_couverte"], name="Part de la perte nette couverte", line_color=BLEU))
-    fig.add_vline(x=seuil, line_dash="dash", line_color=ROUGE)
-    fig.update_layout(height=320, xaxis_title="Seuil de probabilité", yaxis_tickformat=".0%",
-                      margin=dict(t=30), legend=dict(orientation="h", y=1.15))
+    for (nom, sc), couleur in zip(scenarios.items(), [ROUGE, BLEU, VERT]):
+        fig.add_trace(go.Scatter(x=taux_fuite, y=pr.net_gain_by_leak_rate(sc, taux_fuite), name=nom,
+                                 line_color=couleur))
+    fig.add_hline(y=0, line_color=GRIS)
+    sc_f05, sc_f2 = list(scenarios.values())[:2]
+    bascule = pr.switch_leak_rate(sc_f2, sc_f05)
+    if 0 < bascule < 0.6:
+        fig.add_vline(x=bascule, line_dash="dash", line_color=GRIS,
+                      annotation_text=f"bascule : {bascule:.1%}", annotation_position="bottom right")
+    fig.update_layout(height=340, xaxis_title="Part des clients fidèles touchés qui renoncent",
+                      yaxis_title="Gain net (€)", xaxis_tickformat=".0%", margin=dict(t=30),
+                      legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig, width="stretch")
+    if 0 < bascule < 1:
+        st.markdown(
+            f"Avec cette politique, **F2 rapporte plus tant que moins de {bascule:.1%} des fidèles renoncent** ; "
+            f"au-delà, **F0,5 rapporte plus**. L'acompte devient perdant à partir de "
+            f"{sc_f2['taux_fuite_max_acceptable']:.0%} de fuite au seuil F2 et de "
+            f"{sc_f05['taux_fuite_max_acceptable']:.0%} au seuil F0,5."
+        )
 
 # ===========================================================================
 # 4. Surréservation

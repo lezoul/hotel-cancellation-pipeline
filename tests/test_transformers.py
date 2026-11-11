@@ -164,3 +164,12 @@ def test_acompte_base_commune_et_reservations_deja_payees_exclues():
     # Signaler plus large récupère plus et laisse une perte restante plus faible
     assert large["acompte_conserve"] > etroit["acompte_conserve"]
     assert large["perte_nette_restante"] < etroit["perte_nette_restante"]
+
+
+def test_point_de_bascule_entre_deux_seuils():
+    large = pd.Series({"acompte_conserve": 400.0, "revenu_fideles_exposes": 2000.0})
+    etroit = pd.Series({"acompte_conserve": 300.0, "revenu_fideles_exposes": 500.0})
+    bascule = pr.switch_leak_rate(large, etroit)
+    assert np.isclose(bascule, 100.0 / 1500.0)
+    # Au point de bascule, les deux seuils rapportent le même gain net
+    assert np.isclose(pr.net_gain_by_leak_rate(large, [bascule])[0], pr.net_gain_by_leak_rate(etroit, [bascule])[0])

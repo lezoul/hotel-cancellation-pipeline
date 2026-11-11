@@ -258,6 +258,9 @@ def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, polici
     taux = tous["delay_category"].map(resale).astype(float).fillna(float(resale.mean()))
     perte_totale = float((tous["stay_revenue"] * (1 - taux)).where(annulees, 0.0).sum())
 
+    n_annulations = int(annulees.sum())          # toutes les annulations sans dépôt
+    n_fideles = int((~annulees).sum())           # tous les clients fidèles sans dépôt
+
     # Réservations à qui on demande un acompte : signalées ET sans dépôt
     b = bookings.loc[np.asarray(flagged, dtype=bool) & sans_depot].copy()
     cancelled = b["is_canceled"] == 1
@@ -281,10 +284,38 @@ def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, polici
                 "perte_nette_restante": perte_totale - recovered,
                 "part_perte_couverte": recovered / perte_totale if perte_totale else 0.0,
                 "fideles_exposes": int((~cancelled).sum()),
+                "revenu_fideles_exposes": float(loyal_revenue),
+                # Même base pour tous les seuils : part de TOUTES les annulations / de TOUS les fidèles
+                "part_annulations_visees": int(cancelled.sum()) / n_annulations if n_annulations else 0.0,
+                "part_fideles_touches": int((~cancelled).sum()) / n_fideles if n_fideles else 0.0,
                 "taux_fuite_max_acceptable": recovered / loyal_revenue if loyal_revenue else np.nan,
             }
         )
     return pd.DataFrame(rows).set_index("politique")
+
+
+def net_gain_by_leak_rate(scenario: pd.Series, leak_rates) -> np.ndarray:
+    """Gain net d'un acompte selon la part des clients fidèles qui renoncent.
+
+    gain net = acompte conservé - taux de fuite x revenu des fidèles exposés
+
+    Le taux de fuite (part des fidèles à qui on demande un acompte et qui renoncent)
+    décrit la réaction des clients, pas le seuil : c'est la même inconnue pour tous
+    les seuils. Les gains nets de deux seuils se comparent donc sur le même axe.
+    """
+    leak = np.asarray(leak_rates, dtype=float)
+    return scenario["acompte_conserve"] - leak * scenario["revenu_fideles_exposes"]
+
+
+def switch_leak_rate(scenario_a: pd.Series, scenario_b: pd.Series) -> float:
+    """Taux de fuite pour lequel deux seuils rapportent le même gain net (point de bascule).
+
+    En dessous, le seuil qui signale le plus de réservations rapporte plus ; au-dessus,
+    c'est le seuil le plus sélectif. Renvoie NaN si les deux droites sont parallèles.
+    """
+    d_gain = scenario_a["acompte_conserve"] - scenario_b["acompte_conserve"]
+    d_cout = scenario_a["revenu_fideles_exposes"] - scenario_b["revenu_fideles_exposes"]
+    return float(d_gain / d_cout) if d_cout else float("nan")
 
 
 # ===========================================================================
