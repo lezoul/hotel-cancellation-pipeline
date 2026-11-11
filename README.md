@@ -5,6 +5,8 @@ Pipeline scikit-learn complet (prétraitement, transformateurs personnalisés, s
 > Évaluation sommative 2, *Intelligence artificielle appliquée au prétraitement des données* (030513 IFM), Collège La Cité, automne 2026.
 > Auteur : Yacine Lezoul
 
+**Application en ligne : <https://hotel-cancellation-pipeline.streamlit.app>**
+
 ---
 
 ## Résultats clés
@@ -25,7 +27,7 @@ Les deux seuils sont choisis par validation croisée **dans l'entraînement**. A
 | Combien coûtent les annulations sans dépôt ? | 13,1 M€ brut, mais **3,0 M€ net** après revente des chambres (11,7 % du revenu réalisé) |
 | Quand ont-elles lieu ? | 46 % dans le dernier mois avant l'arrivée, qui concentre 53 % de la perte nette |
 | Quelle part des chambres est revendue ? | de 61 % (annulation dans la dernière semaine) à 86 % (plus de 3 mois avant) |
-| Que rapporterait un acompte ? | au seuil F0,5, de 72 % à 232 % de la perte nette selon la politique |
+| Que rapporterait un acompte ? | demandé aux réservations sans dépôt au seuil F0,5, de 44 % à 140 % de la perte nette selon la politique, en ne touchant que 931 clients fidèles (ensemble de test) ; au seuil F2, il récupère plus mais touche 4 281 fidèles |
 
 ---
 
@@ -144,7 +146,8 @@ Le jeu de données est téléchargé automatiquement au premier chargement. Pour
 
 | Étape | Commande | Durée |
 |---|---|---|
-| Application (directement) | `streamlit run app/app.py` | |
+| Application en ligne | <https://hotel-cancellation-pipeline.streamlit.app> | |
+| Application en local | `streamlit run app/app.py` | |
 | 1. Pipeline et modèle | exécuter `notebooks/01_pipeline.ipynb` | environ 20 min |
 | 2. Analyse prescriptive | exécuter `notebooks/02_analyse_prescriptive.ipynb` | environ 2 min |
 | Tests | `python -m pytest -q` | quelques secondes |

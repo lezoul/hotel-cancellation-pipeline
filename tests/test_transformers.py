@@ -136,3 +136,31 @@ def test_acompte_remboursable_rembourse_les_annulations_precoces():
     assert bilan["acompte_conserve"] == 100.0       # seule l'annulation tardive (5 jours) est conservée
     assert bilan["fideles_exposes"] == 1
     assert bilan["taux_fuite_max_acceptable"] == 0.5  # 100 € conservés / 200 € de revenu fidèle
+
+
+def test_reservation_non_remboursable_aucune_perte():
+    # Séjour payé d'avance : l'hôtel garde le paiement, la perte est nulle même à 100 % de risque
+    reco = pr.recommend_actions([1.0, 1.0, 0.9], [550.0, 550.0, 200.0], low=0.17, high=0.54,
+                                deposit_type=["Non Refund", "No Deposit", "Refundable"])
+    assert reco["perte_esperee"].tolist() == [0.0, 550.0, 180.0]
+    assert reco["action_recommandee"].tolist() == [
+        "Séjour déjà payé", "Acompte et surréservation", "Surréservation (dépôt déjà versé)"]
+
+
+def test_acompte_base_commune_et_reservations_deja_payees_exclues():
+    reservations = pd.DataFrame({
+        "is_canceled": [1, 1, 1, 0], "adr": [100.0] * 4, "nights": [2] * 4, "stay_revenue": [200.0] * 4,
+        "cancel_delay": [5, 5, 5, 0], "delay_category": pr.delay_category([5, 5, 5, 0]).values,
+        "deposit_type": ["No Deposit", "No Deposit", "Non Refund", "No Deposit"],
+    })
+    revente = pd.Series(0.0, index=pr.DELAY_LABELS)
+    politique = {"test": ("part", 0.5, None)}
+    etroit = pr.deposit_scenarios(reservations, [True, False, True, False], revente, politique).iloc[0]
+    large = pr.deposit_scenarios(reservations, [True, True, True, True], revente, politique).iloc[0]
+    # Même perte de départ pour les deux seuils : les 2 annulations sans dépôt (2 x 200 €)
+    assert etroit["perte_nette_totale"] == large["perte_nette_totale"] == 400.0
+    # La réservation non remboursable (déjà payée) ne reçoit jamais d'acompte
+    assert etroit["reservations_signalees"] == 1 and large["reservations_signalees"] == 3
+    # Signaler plus large récupère plus et laisse une perte restante plus faible
+    assert large["acompte_conserve"] > etroit["acompte_conserve"]
+    assert large["perte_nette_restante"] < etroit["perte_nette_restante"]

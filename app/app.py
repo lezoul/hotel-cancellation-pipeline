@@ -189,7 +189,8 @@ with tab1:
     p = float(modele.predict_proba(reservation)[0, 1])
     revenu = float(pr.revenue_at_risk([adr], [weekend + semaine])[0])
     zone = pr.risk_level(p, SEUIL_F2, SEUIL_F05)
-    action, description = pr.ACTIONS[zone]
+    action, description = pr.action_for(zone, depot)
+    perte = float(pr.expected_loss([p], [revenu], [depot])[0])
 
     g1, g2 = st.columns([1, 2])
     with g1:
@@ -213,7 +214,8 @@ with tab1:
         k1, k2, k3 = st.columns(3)
         k1.metric("Probabilité d'annulation", f"{p:.1%}")
         k2.metric("Revenu du séjour", euro(revenu), help="Tarif journalier x nuits")
-        k3.metric("Perte espérée", euro(p * revenu), help="Probabilité x revenu, sert à prioriser")
+        k3.metric("Perte espérée", euro(perte),
+                  help="Probabilité x revenu ; 0 € si la réservation est non remboursable (séjour déjà payé)")
         st.success(f"**Action recommandée : {action}**  \n{description}")
 
     st.markdown("##### Sensibilité au délai de réservation")
@@ -257,7 +259,8 @@ with tab2:
     if lot is not None:
         proba_lot = modele.predict_proba(lot[config.RAW_INPUT_FEATURES])[:, 1]
         nuits_lot = lot["stays_in_weekend_nights"] + lot["stays_in_week_nights"]
-        reco = pr.recommend_actions(proba_lot, pr.revenue_at_risk(lot["adr"], nuits_lot), SEUIL_F2, SEUIL_F05)
+        reco = pr.recommend_actions(proba_lot, pr.revenue_at_risk(lot["adr"], nuits_lot), SEUIL_F2, SEUIL_F05,
+                                    deposit_type=lot["deposit_type"])
         sortie = pd.concat(
             [lot[["hotel", "arrival_date_month", "arrival_date_day_of_month", "lead_time", "adr",
                   "market_segment", "deposit_type", "country"]], reco], axis=1
@@ -325,8 +328,10 @@ with tab3:
                "de l'occupation réelle de chaque nuit (méthode détaillée dans le notebook 02).")
 
     st.markdown("#### Simulateur d'acompte")
-    st.caption("Appliqué aux réservations de l'ensemble de test signalées par le modèle. Le niveau d'acompte est "
-               "un choix de l'hôtel ; tout le reste est calculé à partir des données.")
+    st.caption("Appliqué aux réservations SANS dépôt de l'ensemble de test signalées par le modèle (une réservation "
+               "non remboursable est déjà payée). La perte nette de départ est la même pour tous les seuils : celle de "
+               "toutes les annulations sans dépôt. Le niveau d'acompte est un choix de l'hôtel ; tout le reste est "
+               "calculé à partir des données.")
     s1, s2, s3, s4 = st.columns(4)
     type_acompte = s1.radio("Type d'acompte", ["Part du séjour", "Nombre de nuits"])
     if type_acompte == "Part du séjour":
@@ -355,7 +360,8 @@ with tab3:
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Acompte conservé", euro(res["acompte_conserve"]),
               f"{res['part_perte_couverte']:.0%} de la perte nette", delta_color="off")
-    k2.metric("Perte nette restante", euro(res["perte_nette_restante"]))
+    k2.metric("Perte nette restante", euro(res["perte_nette_restante"]),
+              f"sur {euro(res['perte_nette_totale'])} de perte nette totale", delta_color="off")
     k3.metric("Clients fidèles exposés", int(res["fideles_exposes"]),
               f"sur {int(res['reservations_signalees'])} signalées", delta_color="off")
     k4.metric("Taux de fuite maximal acceptable", f"{res['taux_fuite_max_acceptable']:.1%}",

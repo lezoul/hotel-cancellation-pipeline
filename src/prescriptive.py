@@ -221,15 +221,21 @@ def deposit_amount(adr, nights, kind: str, value: float):
 def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, policies: dict | None = None) -> pd.DataFrame:
     """Bilan de chaque politique d'acompte appliquée aux réservations signalées.
 
-    bookings : réservations (avec add_dates) contenant is_canceled
-    flagged  : masque booléen des réservations à qui on demande un acompte
+    bookings : TOUTES les réservations étudiées (avec add_dates) contenant is_canceled
+    flagged  : masque booléen des réservations signalées par le modèle (même longueur)
     resale   : taux de revente par tranche de délai (resale_by_delay)
 
+    Deux règles rendent les seuils comparables :
+      * la base est la même pour tous les seuils : perte nette de TOUTES les annulations
+        sans dépôt (revenu x (1 - taux de revente de la tranche)). Le seuil ne change
+        que ce qui est récupéré, pas la perte de départ ;
+      * l'acompte n'est demandé qu'aux réservations SANS dépôt : une réservation
+        « Non Refund » est déjà payée, une « Refundable » a déjà versé un dépôt.
+
     Pour chaque politique :
-      * perte nette sans acompte = revenu x (1 - taux de revente de la tranche)
-      * acompte conservé : seulement pour les annulations, et seulement si
+      * acompte conservé : seulement pour les annulations signalées, et seulement si
         l'annulation tombe après la date limite de remboursement
-      * perte nette restante = perte nette - acompte conservé
+      * perte nette restante = perte nette totale - acompte conservé
       * clients fidèles exposés = réservations signalées qui ne sont PAS annulées
       * taux de fuite maximal acceptable = acompte conservé / revenu des
         fidèles exposés : si une plus grande part des fidèles renonce à
@@ -241,11 +247,20 @@ def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, polici
     rentable même si TOUS les fidèles exposés renonçaient.
     """
     policies = policies or DEPOSIT_POLICIES
-    b = bookings.loc[np.asarray(flagged)].copy()
+    if "deposit_type" in bookings:
+        sans_depot = (bookings["deposit_type"] == "No Deposit").to_numpy()
+    else:
+        sans_depot = np.ones(len(bookings), dtype=bool)
+
+    # Base commune : perte nette de toutes les annulations sans dépôt
+    tous = bookings.loc[sans_depot]
+    annulees = tous["is_canceled"] == 1
+    taux = tous["delay_category"].map(resale).astype(float).fillna(float(resale.mean()))
+    perte_totale = float((tous["stay_revenue"] * (1 - taux)).where(annulees, 0.0).sum())
+
+    # Réservations à qui on demande un acompte : signalées ET sans dépôt
+    b = bookings.loc[np.asarray(flagged, dtype=bool) & sans_depot].copy()
     cancelled = b["is_canceled"] == 1
-    # Taux de revente associé à la tranche de délai de chaque annulation
-    rate = b["delay_category"].map(resale).astype(float).fillna(float(resale.mean()))
-    net_loss = (b["stay_revenue"] * (1 - rate)).where(cancelled, 0.0)
     loyal_revenue = b.loc[~cancelled, "stay_revenue"].sum()
 
     rows = []
@@ -261,10 +276,10 @@ def deposit_scenarios(bookings: pd.DataFrame, flagged, resale: pd.Series, polici
                 "politique": name,
                 "reservations_signalees": len(b),
                 "annulations_signalees": int(cancelled.sum()),
-                "perte_nette_sans_acompte": float(net_loss.sum()),
+                "perte_nette_totale": perte_totale,
                 "acompte_conserve": recovered,
-                "perte_nette_restante": float(net_loss.sum()) - recovered,
-                "part_perte_couverte": recovered / float(net_loss.sum()) if net_loss.sum() else 0.0,
+                "perte_nette_restante": perte_totale - recovered,
+                "part_perte_couverte": recovered / perte_totale if perte_totale else 0.0,
                 "fideles_exposes": int((~cancelled).sum()),
                 "taux_fuite_max_acceptable": recovered / loyal_revenue if loyal_revenue else np.nan,
             }
@@ -345,18 +360,64 @@ def risk_level(p: float, low: float, high: float) -> str:
     return "Faible"
 
 
-def recommend_actions(proba, revenue, low: float, high: float) -> pd.DataFrame:
-    """Zone de risque, action recommandée et perte espérée pour chaque réservation."""
+# Réservation non remboursable : le client a payé la totalité du séjour.
+# S'il annule, l'hôtel garde le paiement : il ne perd rien, et la revente
+# éventuelle de la chambre est un gain supplémentaire.
+ACTION_NON_REMBOURSABLE = (
+    "Séjour déjà payé",
+    "Aucune relance ni acompte : le client a payé la totalité du séjour et l'hôtel garde ce "
+    "paiement en cas d'annulation. La chambre peut entrer dans la marge de surréservation : "
+    "si elle est libérée, la revendre est un gain.",
+)
+# Réservation remboursable : un dépôt existe déjà, on ne redemande pas d'acompte.
+ACTION_REMBOURSABLE_ELEVE = (
+    "Surréservation (dépôt déjà versé)",
+    "Pas de nouvel acompte : un dépôt remboursable a déjà été versé. La chambre est comptée "
+    "dans la marge de surréservation de la date d'arrivée.",
+)
+
+
+def action_for(level: str, deposit_type: str | None = None) -> tuple[str, str]:
+    """Action recommandée selon la zone de risque ET le type de dépôt."""
+    if deposit_type == "Non Refund":
+        return ACTION_NON_REMBOURSABLE
+    if deposit_type == "Refundable" and level == "Élevé":
+        return ACTION_REMBOURSABLE_ELEVE
+    return ACTIONS[level]
+
+
+def expected_loss(proba, revenue, deposit_type=None) -> np.ndarray:
+    """Perte espérée = probabilité x revenu, nulle pour une réservation non remboursable.
+
+    Une réservation « Non Refund » est payée d'avance : l'hôtel conserve le paiement en cas
+    d'annulation, sa perte est donc de 0 €. Un dépôt « Refundable » est rendu au client :
+    la perte reste probabilité x revenu.
+    """
+    proba = np.asarray(proba, dtype=float)
+    loss = proba * np.asarray(revenue, dtype=float)
+    if deposit_type is not None:
+        paid = np.asarray(deposit_type, dtype=object) == "Non Refund"
+        loss = np.where(paid, 0.0, loss)
+    return loss
+
+
+def recommend_actions(proba, revenue, low: float, high: float, deposit_type=None) -> pd.DataFrame:
+    """Zone de risque, action recommandée et perte espérée pour chaque réservation.
+
+    deposit_type (facultatif) : type de dépôt de chaque réservation. Une réservation non
+    remboursable a une perte espérée nulle et ne reçoit ni relance ni acompte.
+    """
     proba = np.asarray(proba, dtype=float)
     revenue = np.asarray(revenue, dtype=float)
+    deposits = [None] * len(proba) if deposit_type is None else list(deposit_type)
     levels = [risk_level(p, low, high) for p in proba]
     return pd.DataFrame(
         {
             "proba_annulation": proba,
             "revenu_en_jeu": revenue,
-            "perte_esperee": proba * revenue,   # sert à prioriser à risque égal
+            "perte_esperee": expected_loss(proba, revenue, deposit_type),  # sert à prioriser
             "niveau_risque": levels,
-            "action_recommandee": [ACTIONS[lvl][0] for lvl in levels],
+            "action_recommandee": [action_for(lvl, dep)[0] for lvl, dep in zip(levels, deposits)],
         }
     )
 
