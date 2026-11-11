@@ -72,7 +72,7 @@ hotel-cancellation-pipeline/
 │
 ├── reports/
 │   ├── figures/                        # graphiques exportés par les notebooks
-│   └── presentation_annulations.pptx   # diapositives de présentation (17, avec notes)
+│   └── presentation_annulations.pptx   # diapositives de présentation (20, avec notes)
 │
 ├── docs/
 │   ├── document_technique.docx         # document technique (Word, source)
