@@ -328,9 +328,8 @@ with tab3:
                "de l'occupation réelle de chaque nuit (méthode détaillée dans le notebook 02).")
 
     st.markdown("#### Simulateur d'acompte")
-    st.caption("Appliqué aux réservations SANS dépôt de l'ensemble de test signalées par le modèle (une réservation "
-               "non remboursable est déjà payée). La perte nette de départ est la même pour tous les seuils : celle de "
-               "toutes les annulations sans dépôt. Le niveau d'acompte est un choix de l'hôtel ; tout le reste est "
+    st.caption("L'acompte est demandé aux réservations SANS dépôt signalées par le modèle (une réservation non "
+               "remboursable est déjà payée). Le niveau d'acompte est un choix de l'hôtel ; tout le reste est "
                "calculé à partir des données.")
     s1, s2, s3, s4 = st.columns(4)
     type_acompte = s1.radio("Type d'acompte", ["Part du séjour", "Nombre de nuits"])
@@ -340,8 +339,16 @@ with tab3:
     else:
         valeur = s2.slider("Nombre de nuits", 1, 5, 1)
         kind = "nuits"
-    remboursable = s3.slider("Remboursable jusqu'à (jours avant l'arrivée)", 0, 90, 0, 5,
-                             help="0 = jamais remboursé")
+    # Remboursement : décoché = acompte jamais remboursé ; coché = remboursé si le client annule
+    # au moins N jours avant l'arrivée. Plus N est grand, plus l'hôtel conserve d'acomptes.
+    rembourse = s3.checkbox("Acompte remboursable", value=False)
+    if rembourse:
+        delai_remboursement = s3.slider("Remboursé si le client annule au moins N jours avant l'arrivée",
+                                        5, 90, 30, 5)
+        s3.caption("Plus N est grand, plus il faut annuler tôt pour être remboursé : l'hôtel conserve davantage.")
+    else:
+        delai_remboursement = None
+        s3.caption("Jamais remboursé : l'acompte est conservé pour toute annulation.")
     # Seuils exacts du notebook 01 (non arrondis) pour retrouver les mêmes chiffres,
     # ou seuil libre pour explorer
     choix_seuil = s4.radio(
@@ -355,19 +362,39 @@ with tab3:
     else:
         seuil = s4.slider("Seuil choisi", 0.05, 0.95, 0.50, 0.01)
 
-    politique = {"choisie": (kind, valeur, remboursable or None)}
+    politique = {"choisie": (kind, valeur, delai_remboursement)}
     res = pr.deposit_scenarios(test, test["proba"] >= seuil, revente, politique).iloc[0]
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Acompte conservé", euro(res["acompte_conserve"]),
-              f"{res['part_perte_couverte']:.0%} de la perte nette", delta_color="off")
-    k2.metric("Perte nette restante", euro(res["perte_nette_restante"]),
-              f"sur {euro(res['perte_nette_totale'])} au départ", delta_color="off")
-    k3.metric("Annulations visées", int(res["annulations_signalees"]),
-              f"{res['part_annulations_visees']:.0%} de toutes les annulations", delta_color="off")
-    k4.metric("Clients fidèles touchés", int(res["fideles_exposes"]),
-              f"{res['part_fideles_touches']:.1%} de tous les fidèles", delta_color="off")
-    k5.metric("Fuite max. acceptable", f"{res['taux_fuite_max_acceptable']:.1%}",
+    # Les taux sont mesurés sur l'ensemble de test (réservations jamais vues par le modèle), puis
+    # appliqués à la perte nette de toute la période (même calcul que le tableau ci-dessus).
+    perte_periode = float(pertes["perte_nette"].sum())
+    facteur = perte_periode / res["perte_nette_totale"]
+    couverture = res["part_perte_couverte"]
+    compensee = min(couverture, 1.0) * perte_periode
+    restante = max(1.0 - couverture, 0.0) * perte_periode
+    surplus = max(couverture - 1.0, 0.0) * perte_periode
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Perte nette de départ", euro(perte_periode), "toute la période, sans acompte", delta_color="off")
+    k2.metric("Perte compensée par l'acompte", euro(compensee), f"{min(couverture, 1.0):.0%} de la perte",
+              delta_color="off")
+    k3.metric("Perte restante", euro(restante), f"{max(1.0 - couverture, 0.0):.0%} de la perte", delta_color="off")
+    k4.metric("Gain supplémentaire", euro(surplus),
+              "acompte au-delà de la perte" if surplus > 0 else "aucun", delta_color="off",
+              help="Acompte conservé au-delà de la perte, parce que la chambre est aussi revendue. "
+                   "Calcul théorique : il suppose que les clients réservent et annulent comme sans acompte, "
+                   "ce qui devient irréaliste pour un acompte élevé.")
+    k5, k6, k7 = st.columns(3)
+    k5.metric("Annulations visées", f"{res['part_annulations_visees']:.0%}",
+              "de toutes les annulations sans dépôt", delta_color="off")
+    k6.metric("Clients fidèles touchés", f"{res['part_fideles_touches']:.1%}",
+              "de tous les clients fidèles", delta_color="off")
+    k7.metric("Fuite max. acceptable", f"{res['taux_fuite_max_acceptable']:.1%}",
               help="Part des fidèles touchés qui peuvent renoncer avant que l'acompte coûte plus qu'il ne rapporte")
+    st.caption(f"Les taux sont mesurés sur l'ensemble de test ({len(test):,} réservations jamais vues par le modèle), "
+               "puis appliqués à la perte nette de toute la période (juillet 2015 à août 2017).".replace(",", " "))
+    if surplus > 0:
+        st.info("L'acompte couvre toute la perte. Le gain supplémentaire est théorique : il suppose que les clients "
+                "réservent et annulent comme sans acompte, ce qui n'est pas réaliste pour un acompte aussi élevé.")
 
     # Comparaison des seuils sur une échelle commune : le gain net selon la part des fidèles
     # qui renoncent. Ce taux décrit la réaction des clients, pas le seuil : même axe pour tous.
@@ -383,7 +410,7 @@ with tab3:
     taux_fuite = np.linspace(0, 0.6, 61)
     fig = go.Figure()
     for (nom, sc), couleur in zip(scenarios.items(), [ROUGE, BLEU, VERT]):
-        fig.add_trace(go.Scatter(x=taux_fuite, y=pr.net_gain_by_leak_rate(sc, taux_fuite), name=nom,
+        fig.add_trace(go.Scatter(x=taux_fuite, y=pr.net_gain_by_leak_rate(sc, taux_fuite) * facteur, name=nom,
                                  line_color=couleur))
     fig.add_hline(y=0, line_color=GRIS)
     sc_f05, sc_f2 = list(scenarios.values())[:2]
@@ -392,7 +419,7 @@ with tab3:
         fig.add_vline(x=bascule, line_dash="dash", line_color=GRIS,
                       annotation_text=f"bascule : {bascule:.1%}", annotation_position="bottom right")
     fig.update_layout(height=340, xaxis_title="Part des clients fidèles touchés qui renoncent",
-                      yaxis_title="Gain net (€)", xaxis_tickformat=".0%", margin=dict(t=30),
+                      yaxis_title="Gain net sur la période (€)", xaxis_tickformat=".0%", margin=dict(t=30),
                       legend=dict(orientation="h", y=1.12))
     st.plotly_chart(fig, width="stretch")
     if 0 < bascule < 1:
