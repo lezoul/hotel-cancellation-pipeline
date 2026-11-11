@@ -434,7 +434,7 @@ with tab3:
 # 4. Surréservation
 # ===========================================================================
 with tab4:
-    st.subheader("Combien de réservations accepter au-delà de la capacité ?")
+    st.subheader("Combien de réservations de plus accepter pour cette date ?")
     st.markdown(
         "Le modèle donne la probabilité d'annulation de chaque réservation au carnet. On en déduit, pour chaque "
         "nombre de réservations ajoutées, le **taux d'occupation espéré** et le **risque de devoir reloger** un "
@@ -464,9 +464,13 @@ with tab4:
     plan = pr.overbooking_plan(carnet["proba"], int(cap), p_nouvelles, max_extra=max(int(cap), 10))
     base = plan.iloc[0]
 
-    k_test = st.slider("Réservations acceptées en plus", 0, int(plan["reservations_supplementaires"].max()), 5)
+    k_test = st.slider("Réservations ajoutées au carnet", 0, int(plan["reservations_supplementaires"].max()), 5)
     retenu = plan.iloc[k_test]
     k = int(retenu["reservations_supplementaires"])
+    total = len(carnet) + k
+    depassement = total - int(cap)
+    st.caption(f"{len(carnet)} + {k} = **{total} réservations pour {int(cap)} chambres**"
+               + (f" : {depassement} au-delà de la capacité." if depassement > 0 else " : pas de surréservation."))
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Réservations supplémentaires", f"+{k}")
@@ -477,7 +481,13 @@ with tab4:
     k4.metric("Clients relogés en moyenne", f"{retenu['clients_reloges_esperes']:.2f}",
               help="Nombre moyen de clients sans chambre ce soir-là")
     gain = retenu["chambres_occupees_esperees"] - base["chambres_occupees_esperees"]
-    st.markdown(f"**Bilan** : {gain:.1f} chambres occupées en plus en moyenne, contre "
+    tarif_moyen = float(carnet["adr"].mean())   # tarif moyen par nuit des réservations de cette date
+    st.metric("Revenu supplémentaire espéré (cette nuit)", euro(gain * tarif_moyen),
+              f"{gain:.1f} chambres occupées en plus × {euro(tarif_moyen)} par nuit ; coût des relogements non déduit",
+              delta_color="off",
+              help="Le coût d'un relogement (autre hôtel, transport, geste commercial) n'est pas dans les données : "
+                   "à mettre en balance avec le nombre moyen de clients relogés.")
+    st.markdown(f"**Bilan** : {euro(gain * tarif_moyen)} de revenu en plus en moyenne, contre "
                 f"{retenu['clients_reloges_esperes']:.2f} client relogé en moyenne et "
                 f"{retenu['prob_au_moins_un_reloge']:.1%} de risque d'en reloger au moins un. "
                 f"Annulations prévues pour cette date : {carnet['proba'].sum():.1f} "
@@ -489,7 +499,7 @@ with tab4:
     fig.add_trace(go.Scatter(x=plan["reservations_supplementaires"], y=plan["prob_au_moins_un_reloge"],
                              name="Risque de relogement", line_color=ROUGE))
     fig.add_vline(x=k, line_dash="dash", line_color=GRIS, annotation_text=f"+{k}")
-    fig.update_layout(height=350, xaxis_title="Réservations acceptées au-delà de la capacité",
+    fig.update_layout(height=350, xaxis_title="Réservations ajoutées au carnet",
                       yaxis_tickformat=".0%", margin=dict(t=30), legend=dict(orientation="h", y=1.15))
     st.plotly_chart(fig, width="stretch")
     st.caption("Les dates proviennent de l'ensemble de test (20 % des réservations) : le carnet est donc réduit, "
