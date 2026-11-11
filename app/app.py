@@ -455,8 +455,16 @@ with tab4:
     carnet = sous[(sous["arrival_date_year"] == a_) & (sous["arrival_date_month"] == mo_)
                   & (sous["arrival_date_day_of_month"] == d_)]
 
+    # Capacité de l'hôtel estimée à partir de l'occupation réelle (99e centile), ramenée à l'échelle de
+    # l'ensemble de test : le carnet ne contient que les réservations de cet échantillon.
+    _, capacite_hotels = charger_revente()
+    toutes = charger_toutes()
+    echelle = (test["hotel"] == hotel_choisi).sum() / (toutes["hotel"] == hotel_choisi).sum()
+    cap = max(int(round(float(capacite_hotels[hotel_choisi]) * echelle)), 1)
     c1, c2 = st.columns(2)
-    cap = c1.number_input("Capacité (chambres)", 1, 500, len(carnet), help="Par défaut : hôtel complet")
+    c1.metric("Capacité (chambres)", cap,
+              help=f"Capacité estimée de l'hôtel ({int(capacite_hotels[hotel_choisi])} chambres, d'après l'occupation "
+                   f"réelle), ramenée à l'échelle de l'ensemble de test ({echelle:.0%} des réservations de cet hôtel).")
     # Calculée par le modèle : probabilité moyenne des réservations de cette date
     p_nouvelles = float(carnet["proba"].mean())
     c2.metric("Probabilité d'annulation des réservations ajoutées", f"{p_nouvelles:.1%}",
