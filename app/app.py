@@ -436,9 +436,9 @@ with tab3:
 with tab4:
     st.subheader("Combien de réservations accepter au-delà de la capacité ?")
     st.markdown(
-        "Le nombre de clients présents suit une **loi de Poisson binomiale** (chaque réservation a sa propre "
-        "probabilité d'annulation). On retient le plus grand nombre de réservations supplémentaires tel que le "
-        "**risque de devoir reloger au moins un client** reste sous le niveau choisi."
+        "Le modèle donne la probabilité d'annulation de chaque réservation au carnet. On en déduit, pour chaque "
+        "nombre de réservations ajoutées, le **taux d'occupation espéré** et le **risque de devoir reloger** un "
+        "client (loi de Poisson binomiale). Faites varier le nombre de réservations en plus pour voir le compromis."
     )
     _, test = charger_test()
     c1, c2 = st.columns(2)
@@ -455,30 +455,39 @@ with tab4:
     carnet = sous[(sous["arrival_date_year"] == a_) & (sous["arrival_date_month"] == mo_)
                   & (sous["arrival_date_day_of_month"] == d_)]
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     cap = c1.number_input("Capacité (chambres)", 1, 500, len(carnet), help="Par défaut : hôtel complet")
-    risque_max = c2.slider("Risque de relogement accepté", 0.01, 0.30, 0.05, 0.01, format="%.2f")
-    p_nouvelles = c3.slider("Probabilité d'annulation des nouvelles réservations", 0.0, 0.9,
-                            float(round(carnet["proba"].mean(), 2)), 0.01)
-
+    # Calculée par le modèle : probabilité moyenne des réservations de cette date
+    p_nouvelles = float(carnet["proba"].mean())
+    c2.metric("Probabilité d'annulation des réservations ajoutées", f"{p_nouvelles:.1%}",
+              help="Calculée par le modèle : moyenne des probabilités des réservations de cette date")
     plan = pr.overbooking_plan(carnet["proba"], int(cap), p_nouvelles, max_extra=max(int(cap), 10))
-    retenu = pr.max_safe_overbooking(plan, risque_max)
     base = plan.iloc[0]
+
+    k_test = st.slider("Réservations acceptées en plus", 0, int(plan["reservations_supplementaires"].max()), 5)
+    retenu = plan.iloc[k_test]
     k = int(retenu["reservations_supplementaires"])
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Réservations supplémentaires", f"+{k}")
     k2.metric("Taux d'occupation espéré", f"{retenu['taux_occupation_espere']:.1%}",
-              f"{(retenu['taux_occupation_espere'] - base['taux_occupation_espere']) * 100:+.1f} pts")
-    k3.metric("Risque de relogement", f"{retenu['prob_au_moins_un_reloge']:.1%}")
-    k4.metric("Annulations prévues / observées", f"{carnet['proba'].sum():.1f} / {int(carnet['is_canceled'].sum())}")
+              f"{(retenu['taux_occupation_espere'] - base['taux_occupation_espere']) * 100:+.1f} pts "
+              f"(sans surréservation : {base['taux_occupation_espere']:.0%})", delta_color="off")
+    k3.metric("Risque de reloger au moins un client", f"{retenu['prob_au_moins_un_reloge']:.1%}")
+    k4.metric("Clients relogés en moyenne", f"{retenu['clients_reloges_esperes']:.2f}",
+              help="Nombre moyen de clients sans chambre ce soir-là")
+    gain = retenu["chambres_occupees_esperees"] - base["chambres_occupees_esperees"]
+    st.markdown(f"**Bilan** : {gain:.1f} chambres occupées en plus en moyenne, contre "
+                f"{retenu['clients_reloges_esperes']:.2f} client relogé en moyenne et "
+                f"{retenu['prob_au_moins_un_reloge']:.1%} de risque d'en reloger au moins un. "
+                f"Annulations prévues pour cette date : {carnet['proba'].sum():.1f} "
+                f"(observées : {int(carnet['is_canceled'].sum())}).")
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=plan["reservations_supplementaires"], y=plan["taux_occupation_espere"],
                              name="Taux d'occupation espéré", line_color=BLEU))
     fig.add_trace(go.Scatter(x=plan["reservations_supplementaires"], y=plan["prob_au_moins_un_reloge"],
                              name="Risque de relogement", line_color=ROUGE))
-    fig.add_hline(y=risque_max, line_dash="dot", line_color=ROUGE)
     fig.add_vline(x=k, line_dash="dash", line_color=GRIS, annotation_text=f"+{k}")
     fig.update_layout(height=350, xaxis_title="Réservations acceptées au-delà de la capacité",
                       yaxis_tickformat=".0%", margin=dict(t=30), legend=dict(orientation="h", y=1.15))
